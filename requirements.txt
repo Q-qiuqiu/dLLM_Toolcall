@@ -5,3 +5,4 @@ numpy
 torch
 matplotlib
 pytest
+json-repair==0.64.0

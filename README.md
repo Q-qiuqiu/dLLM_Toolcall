@@ -174,18 +174,11 @@ python reanalyze_run.py \
 
 启动模拟假设每个工具独立并行启动，不考虑设备争用或 Docker 调度开销。错误预测的类型计入 `wrong_preload_cost_s`；漏掉的必要类型回退到它的 natural 首次发现时间再启动。
 
-## OMTP：Commit 策略迁移实验
+## 固定方法：OMTP + Fallback
 
-`run_omtp_experiment.py` 在同一次无缓存生成的每个已有 Forward 上同时计算六种方法，不新增模型 Forward：
+`run_omtp_experiment.py` 现在只运行优化后的 `omtp_fallback`。每个 occurrence 轨迹不可撤回地采用最早到达的事件：OMTP latent region Stable N、唯一 committed prefix，最后是 natural completion。`latent_region`、`prefix` 和 `natural` 原始事件仍保留作审计，但不再作为独立在线方法计分。自然解码作为显式分析基线，与 OMTP 在同一轮 Forward、同一时间零点下记录。
 
-- A `natural_decoding`：committed token 中完整的 tool name；
-- B `intermediate_argmax`：第一次非空的临时 Argmax 工具集合；
-- C `whole_set_argmax_stable_n2`：原有整集合 Stable N=2；
-- D `per_tool_argmax_stable_n2`：每个候选工具独立做 Argmax Stable N=2；
-- E `omtp_latent_region_n2`：`name` anchor 轨迹、半径 4 的 candidate-aware region top-2-mean score、每轨迹 Stable N=2；
-- F `omtp_with_fallback`：每个 occurrence 轨迹按真实可用时间采用首次 `latent_region`、唯一 `prefix` 或 `natural` 事件。
-
-E/F 只使用当前请求的 function definitions 建立候选表。Ground Truth 和最终输出仅在生成结束后标注历史事件，不参与 anchor、评分、稳定判定或触发。Anchor 只扫描 generation region，并以 JSON 对象深度排除 `arguments` 嵌套对象中的 `name` 字段。所有事件原样保留；错误事件不会被最终答案回删。
+算法只使用当前请求 function definitions 中的候选名称。Ground Truth 和最终输出仅在生成结束后标注历史事件，不参与 anchor、评分、稳定判定或触发。Anchor 只扫描 generation region，并以 JSON 对象深度排除 `arguments` 嵌套对象中的 `name` 字段。错误在线事件不会被最终答案回删。
 
 20 条 smoke（其中第一条执行 warm observer-off、计时 observer-off、observer-on parity）：
 
@@ -215,51 +208,15 @@ CUDA_VISIBLE_DEVICES=0 /home/yzx/miniconda3/envs/llada/bin/python run_omtp_exper
   --min-seen 2 --min-support 0.5 --seed 20261009 --parity-samples 1
 ```
 
-新增输出为 `omtp_events.jsonl`、`omtp_trajectory.jsonl`、`omtp_samples.jsonl`、`omtp_summary.csv`、`omtp_comparison.csv` 及五张 `figures/` 对比图。`online_first_trigger_time_s` 是因果在线触发时间；`oracle_*` 字段是生成结束后的离线正确性标注。所有正式触发时间均在产生该事件的 observer 检测/评分完成后采集，不使用 Forward 完成时刻代替。
+新增输出为 `omtp_events.jsonl`（所有原始事件）、`omtp_fallback_events.jsonl`（真正采用的不可撤回事件）、`natural_events.jsonl`（committed token 自然识别事件）、`position_records.jsonl`（逐调用位置的 OMTP/Natural 配对记录）、`omtp_trajectory.jsonl`、`omtp_samples.jsonl`、`omtp_summary.csv`、`omtp_comparison.csv`、`omtp_position_summary.csv`、`omtp_diagnostics.csv` 和 `figures/`。其中 diagnostics 汇总去重后的错误工具触发、Final Raw Text 与 Strict JSON 工具集合差异，以及完整的 OMTP/Natural 成功组合；这些都是生成结束后的离线统计。每个样本的 `natural_baseline` 保存自然基线分别相对最终输出和 Ground Truth 的 P/R/F1、Set EM 与检测时间；`per_tool_predictions` 同时保存 `T_online`、`T_natural` 和配对提前量。`online_first_trigger_time_s` 是因果在线触发时间；`oracle_*` 是生成结束后的离线正确性标注。触发时间包含 observer 检测和评分开销。
 
-### 已完成的 20 条 smoke
+评测按宽松到严格分层：`all_tool_types_prefetched` 只检查去重后的必需工具类型是否全部被预取，重复次数和额外误报不影响通过；`all_tool_occurrences_prefetched` 按 multiset 检查所有调用次数是否覆盖；`tool_occurrence_multiset_exact_match` 检查无序名称及次数完全一致；`position_accuracy`/`position_exact_match` 检查按生成位置排序后的第 i 个调用是否对应。`position_records` 保存每个位置的目标名称、OMTP/Natural 名称、时间、Forward、正确性和提前量。这部分匹配与 CSV 汇总在 `_generate_once` 返回后离线执行，不计入生成墙钟或在线触发时间，也不改变 NFE。
 
-最终代码对应结果目录是 `results/omtp_smoke20_global128_s32_n2_v2`。20/20 请求均完成且每条都是 32 NFE；parity 样本的 observer on/off token 输出和 NFE 完全一致。最终生成 JSON 正确率为 85%，Ground Truth 工具集合 EM 为 75%，本地 BFCL-compatible AST 为 60%。
+固定实现缓存候选名称 tokenization、融合 top-1/row-max、一次式 JSON 深度扫描、复用局部 log-partition，并按名称 token 长度批量评分。`--stable-n`、`--min-top1-score` 和 `--min-margin` 是该方法自身参数；默认关闭置信度门限。Fallback 始终启用，命令行不再提供关闭开关。`--profile-observer` 仅用于同步诊断，不应用于正式墙钟结果。
 
-相对 Ground Truth，以“运行期间所有不可撤回在线事件的工具类型并集”计分：
+保留集 40–59 的历史 C 结果仍位于原结果目录，仅用于追溯：Ground Truth P/R/F1 为 .933/.983/.950，Set EM .85，observer 约 .216 秒/样本。由于当前输出语义已固定为 OMTP+fallback，旧的多方法 CSV 不应与新 run 混用。
 
-| 方法 | Precision | Recall | F1 | Set EM | Oracle 精确集合时间 mean / P50 / P95 | 有效数 |
-|---|---:|---:|---:|---:|---:|---:|
-| Whole-set Argmax Stable N=2 | 0.9583 | 1.0000 | 0.9733 | 0.90 | 3.138 / 3.561 / 4.969 s | 20/20 |
-| Per-tool Argmax Stable N=2 | 0.9583 | 1.0000 | 0.9733 | 0.90 | 3.138 / 3.561 / 4.969 s | 20/20 |
-| OMTP latent-region N=2 | 0.9500 | 0.9750 | 0.9583 | 0.90 | 2.811 / 3.013 / 5.134 s | 18/20 |
-| OMTP + fallback | 0.9500 | 0.9750 | 0.9583 | 0.90 | 2.721 / 3.013 / 4.473 s | 18/20 |
-| Natural | 0.9333 | 0.9250 | 0.9233 | 0.85 | 5.041 / 5.798 / 6.665 s | 17/20 |
-
-OMTP 与 Whole-set Stable 同时达到过 Ground Truth 精确集合的 18 条配对样本上，OMTP 早 0.399 s（P50 0.071 s，P95 3.485 s）。但 OMTP 的 F1 低 0.015，且精确集合历史覆盖为 18/20、低于 Stable 的 20/20。因此本次小样本结论是 OMTP 有平均时延收益，但尚不能称为准确率和覆盖率上的全面改进。完整数字、两套 reference（最终生成 / Ground Truth）及有效分母以 `omtp_comparison.csv` 为准。
-
-## OMTP 性能优化与可靠性消融
-
-`--observer-mode` 保留三个互不覆盖的实现：
-
-- `original`：原始 OMTP，作为算法和性能基线；
-- `optimized`：缓存候选名称 tokenization、融合 top-1/row-max、一次式 JSON 深度扫描、局部 log-partition 复用，并按名称 token 长度批量计算候选/位置分数；
-- `selective`：先在 anchor 精确位置执行廉价评分，仅在 top-1 或 margin 不确定时执行完整 region scoring。
-
-可靠性开关为 `--min-top1-score`、`--min-margin`、`--stable-n {1,2,3}` 和 `--disable-prefix-fallback`。默认阈值均关闭，因此不会改变原始策略。每个 latent 轨迹额外记录 `name_uncommitted_ratio`。`--profile-observer` 会在模块边界同步 GPU，仅用于诊断；正式墙钟对照不得开启它。
-
-同一批前 5 条样本的同步 Profile 显示：原始 anchor detection 为 41.433 ms/Forward，优化后为 2.204 ms/Forward；observer 总处理时间从 1.472 s/样本降至 0.225 s/样本。原始实现中 anchor detection 占排除重叠同步计时后的 94.3%，瓶颈来自每个 Forward 重复扫描生成区/词表和重复 token decode。优化版只搬运 token id 与小型分数，不把完整 logits 搬到 CPU；5 条共记录 GPU→CPU 383,944 bytes，CPU→GPU 127,957 bytes。
-
-数据严格分为三段：0–19 只用于 Smoke/实现验证，20–39 只用于 Selective 路由和 confidence gate 校准，40–59 是未参与阈值选择的保留测试。校准集选择 `selective_refine_margin=0.5`、`selective_refine_top1=-4.0`；E 另外使用 `min_margin=0.5` 并关闭 prefix fallback。绝对 top-1 gate 在校准集上损害 recall，因此保持关闭。
-
-保留集 40–59（Ground Truth reference）结果：
-
-| 方法 | P / R / F1 | Set EM | 精确集合历史覆盖 | 精确时间 mean / P50 / P95 | Observer / 样本 | 生成墙钟 / 样本 |
-|---|---:|---:|---:|---:|---:|---:|
-| A Argmax Stable N=2 | .850 / .883 / .857 | .75 | 16/20 | 2.477 / 2.526 / 3.466 s | .053 s | 5.456 s |
-| B 原始 OMTP | .933 / .983 / .950 | .85 | 18/20 | 3.366 / 3.180 / 6.264 s | 1.617 s | 6.919 s |
-| C 优化 OMTP | .933 / .983 / .950 | .85 | 18/20 | 2.588 / 2.437 / 5.172 s | .216 s | 5.587 s |
-| D Selective OMTP | .933 / .983 / .950 | .85 | 18/20 | 2.572 / 2.441 / 5.191 s | .264 s | 5.629 s |
-| E Selective + gates | .925 / .867 / .868 | .65 | 14/20 | 2.462 / 2.457 / 4.512 s | .271 s | 5.645 s |
-
-C 相对 B 的 observer 时间下降 86.6%，生成墙钟下降 19.3%；相对 A 的生成墙钟开销仅 2.4%。B/C 的模型输出和 OMTP 事件签名均为 20/20 相同，所有 A–E 模型输出均相同、每条均为 32 NFE。C 相对 A 在 16 条共同成功样本上平均提前 0.134 s、P50 0.040 s、P95 1.898 s，胜/负为 8/8，另有 2 条只有 C 成功。D 没有降低成本：校准后的路由仍有 821 次 refine、345 次 cheap，且 observer 比 C 慢 21.9%，因此本数据上 Selective Region Scoring 不比直接优化后的 full-region 实现更有价值。E 的门限没有在保留集上泛化，漏检明显增加，不能作为默认策略。
-
-复现 C（将 `--observer-mode` 换为 `original` 或 `selective` 可运行 B/D；E 再增加 `--min-margin 0.5 --disable-prefix-fallback`）：
+固定方法运行命令：
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 /home/yzx/miniconda3/envs/llada/bin/python run_omtp_experiment.py \
@@ -267,13 +224,10 @@ CUDA_VISIBLE_DEVICES=0 /home/yzx/miniconda3/envs/llada/bin/python run_omtp_exper
   --answers data/bfcl/BFCL_v4_parallel_multiple_answers.json \
   --model-path /data/labshare/Param/llada \
   --fastdllm-root /data/home/yzx/Fast-dLLM \
-  --output-dir results/holdout40_59_C_optimized_omtp_rerun \
+  --output-dir results/holdout40_59_omtp_fallback_fixed \
   --start 40 --limit 20 --gen-length 128 --block-length 128 --steps 32 \
-  --temperature 0 --stable-n 2 --seed 20261009 \
-  --observer-mode optimized --parity-samples 1
+  --temperature 0 --stable-n 2 --seed 20261009 --parity-samples 1
 ```
-
-配对总表和校验位于 `results/ablation_ABCDE_holdout40_59/`；各方法的五张图和逐事件日志位于对应的 `results/holdout40_59_*` 目录。
 
 ## 无 GPU 验证
 
@@ -283,3 +237,96 @@ python -m pytest -q
 ```
 
 当前实现的无 GPU 测试覆盖 BFCL 数据适配、ground-truth prompt 隔离、严格/局部 parser、重复调用与 AST、observer 开关输出一致性、block 元数据、N-stable 和启动模拟。
+
+## TaskBench DailyLife 跨 Benchmark 实验
+
+TaskBench 实验只增加数据适配、固定样本清单、离线评测和报表；生成仍复用
+`run_omtp_experiment._run_sample` 与现有 Optimized OMTP + Prefix/Natural
+Fallback。命令行不开放生成或 OMTP 参数，固定为 generation/block length 128、
+32 steps、temperature 0、Stable N=2、region radius 4、region top-k 2、
+min-seen 2、min-support .5、无 confidence gate。
+
+官方 DailyLife 数据保存在 `data/taskbench/data_dailylifeapis/`。使用系统 Python
+可从 Parquet 重新生成固定且互斥的清单：
+
+```bash
+cd /data/home/yzx/dLLM_Toolcall
+python prepare_taskbench.py \
+  --parquet data/taskbench/data_dailylifeapis/improved.parquet \
+  --tool-catalog data/taskbench/data_dailylifeapis/tool_desc.json \
+  --output-dir data/taskbench/data_dailylifeapis/splits \
+  --seed 20261009 --smoke-per-type 10 --formal-per-type 100
+```
+
+Smoke Test（10 Chain + 10 DAG）：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 /home/yzx/miniconda3/envs/llada/bin/python \
+  run_taskbench_experiment.py \
+  --manifest data/taskbench/data_dailylifeapis/splits/smoke20.jsonl \
+  --tool-catalog data/taskbench/data_dailylifeapis/tool_desc.json \
+  --model-path /data/labshare/Param/llada \
+  --fastdllm-root /data/home/yzx/Fast-dLLM \
+  --output-dir results/taskbench_dailylife_smoke20_fixed \
+  --parity-samples 1
+```
+
+Smoke 的 JSON、事件、NFE=32 和 parity 均正常后，再运行互斥的正式 200 条：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 /home/yzx/miniconda3/envs/llada/bin/python \
+  run_taskbench_experiment.py \
+  --manifest data/taskbench/data_dailylifeapis/splits/formal200.jsonl \
+  --tool-catalog data/taskbench/data_dailylifeapis/tool_desc.json \
+  --model-path /data/labshare/Param/llada \
+  --fastdllm-root /data/home/yzx/Fast-dLLM \
+  --output-dir results/taskbench_dailylife_formal200_fixed \
+  --parity-samples 1
+```
+
+同一固定128/32配置可通过 `--cache-mode` 选择 Fast-dLLM v1 No Cache
+或 Dual Cache。Dual Cache 的 observer 直接复用缓存解码每次已有的 logits，
+不增加模型 Forward；全局单 Block 的128个生成位置在每步仍全部可见。
+Dual Cache Smoke 使用独立结果目录：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 /home/yzx/miniconda3/envs/llada/bin/python \
+  run_taskbench_experiment.py \
+  --manifest data/taskbench/data_dailylifeapis/splits/smoke20.jsonl \
+  --tool-catalog data/taskbench/data_dailylifeapis/tool_desc.json \
+  --model-path /data/labshare/Param/llada \
+  --fastdllm-root /data/home/yzx/Fast-dLLM \
+  --cache-mode dual \
+  --output-dir results/taskbench_dailylife_smoke20_dual_cache_fixed \
+  --parity-samples 1
+```
+
+省略 `--cache-mode` 或显式传入 `--cache-mode none` 即为原始 No Cache
+策略。Parity 比较的是同一种 cache mode 下 Observer Off/On 的输出和NFE；
+No Cache与Dual Cache之间的生成一致性使用两个独立run按 sample ID离线配对。
+
+每条 Prompt 都包含完整的 40 个 DailyLife 候选工具，只读取 instruction 与工具
+目录；Ground Truth 调用、依赖边和参考步骤仅随结果保存并用于生成结束后的离线评测。
+逐位置指标按 TaskBench `tool_nodes`/参考步骤顺序定义；依赖边只用于 Chain/DAG
+分组。本次固定清单不存在重复工具调用样本，因此 occurrence/multiset 指标会保留，
+但不能据此评估重复调用泛化能力。
+
+独立结果目录包含 `taskbench_samples.jsonl`、三种方法各自事件流、逐 Forward
+轨迹、逐位置记录、失败记录、metadata、四张汇总 CSV 与 `figures/`。三种方法为
+Natural、纯 latent-region OMTP、正式 OMTP+Fallback；所有正确性与配对提前量均为
+生成结束后的 Ground Truth 离线标注，不反馈到在线策略。
+
+TaskBench 还会在生成彻底结束后使用 `json-repair` 做独立的离线语法修复。
+原始文本、原始严格 JSON 指标和修复后指标会同时保留；修复结果不进入
+OMTP、Natural 检测或模型输入。对已有结果可运行：
+
+```bash
+/home/yzx/miniconda3/envs/llada/bin/python repair_taskbench_results.py \
+  --result-dir results/taskbench_dailylife_smoke20_dual_cache_fixed \
+  --manifest data/taskbench/data_dailylifeapis/splits/smoke20.jsonl \
+  --tool-catalog data/taskbench/data_dailylifeapis/tool_desc.json
+```
+
+该命令不会覆盖原始 `taskbench_samples.jsonl`，而是新增
+`taskbench_json_repair_samples.jsonl`、`taskbench_json_repair_summary.csv` 和
+`taskbench_json_repair_failures.jsonl`。

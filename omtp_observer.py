@@ -35,7 +35,6 @@ class OMTPConfig:
     min_anchor_gap: int = 8
     min_top1_score: float | None = None
     min_margin: float | None = None
-    prefix_fallback_enabled: bool = True
 
     def validate(self) -> None:
         if self.stable_n not in (1, 2, 3):
@@ -68,7 +67,7 @@ def _json_object_depth(text: str) -> int:
 
 
 class OMTPObserver:
-    """Composite A--F observer sharing exactly one model forward per step."""
+    """OMTP observer with latent, unique-prefix, and natural fallback events."""
 
     def __init__(
         self,
@@ -91,6 +90,7 @@ class OMTPObserver:
             candidate_names=self.candidate_names,
             stable_n=stable_n,
             top_k=1,
+            enable_stable_prediction=False,
         )
         self._candidate_ids = {
             name: tuple(self._encode(name)) for name in self.candidate_names
@@ -106,10 +106,7 @@ class OMTPObserver:
         self.trajectory: list[dict[str, Any]] = []
         self.events: list[dict[str, Any]] = []
         self.latent_events: list[dict[str, Any]] = []
-        self.per_tool_argmax_events: list[dict[str, Any]] = []
         self.fallback_commits: dict[int, dict[str, Any]] = {}
-        self._argmax_runs = {name: 0 for name in self.candidate_names}
-        self._argmax_emitted: set[str] = set()
         self.natural_available_by_tool: dict[str, float] = {}
         self.omtp_processing_s = 0.0
         self.total_processing_s = 0.0
@@ -184,16 +181,8 @@ class OMTPObserver:
         return self.baseline.steps
 
     @property
-    def stable_events(self):
-        return self.baseline.stable_events
-
-    @property
     def first_natural_by_tool(self):
         return self.baseline.first_natural_by_tool
-
-    @property
-    def first_predict_by_tool(self):
-        return self.baseline.first_predict_by_tool
 
     def _encode(self, text: str) -> list[int]:
         try:
@@ -231,7 +220,6 @@ class OMTPObserver:
         self._callback_started = callback_start
         self._callback_base_s = observation.commit_elapsed_s
         detection_start_s = self._relative_now()
-        self._observe_argmax_per_tool(observation)
         self._observe_omtp(observation, detection_start_s)
         omtp_end = time.perf_counter()
         self.omtp_processing_s += omtp_end - omtp_start
@@ -241,34 +229,12 @@ class OMTPObserver:
         step["omtp_detection_complete_time_s"] = self._relative_now()
         step["omtp_processing_s"] = omtp_end - omtp_start
         step["combined_observer_processing_s"] = omtp_end - callback_start
-        step["per_tool_argmax_committed_tools"] = sorted(
-            event["predicted_tool"] for event in self.per_tool_argmax_events
-        )
         step["omtp_latent_committed_tools"] = sorted(
             {event["predicted_tool"] for event in self.latent_events}
         )
         step["omtp_fallback_committed_tools"] = sorted(
             {event["predicted_tool"] for event in self.fallback_commits.values()}
         )
-
-    def _observe_argmax_per_tool(self, observation: ForwardObservation) -> None:
-        current = set(self.baseline.steps[-1]["predicted_tool_types"])
-        for name in self.candidate_names:
-            self._argmax_runs[name] = self._argmax_runs[name] + 1 if name in current else 0
-            if (
-                self._argmax_runs[name] >= self.config.stable_n
-                and name not in self._argmax_emitted
-            ):
-                event = {
-                    "source": "per_tool_argmax",
-                    "track_id": None,
-                    "predicted_tool": name,
-                    "forward_step": observation.forward_index,
-                    "predict_time_s": self._relative_now(),
-                    "stable_count": self._argmax_runs[name],
-                }
-                self._argmax_emitted.add(name)
-                self.per_tool_argmax_events.append(event)
 
     def _temporary_ids(self, observation: ForwardObservation) -> torch.Tensor:
         generation = observation.committed_x[0, observation.prompt_length:]
@@ -616,11 +582,7 @@ class OMTPObserver:
                 prefix, natural = self._prefix_and_natural(
                     observation, int(track["center"])
                 )
-            if (
-                self.config.prefix_fallback_enabled
-                and prefix is not None
-                and not track["prefix_triggered"]
-            ):
+            if prefix is not None and not track["prefix_triggered"]:
                 track["prefix_triggered"] = True
                 event = self._emit(
                     track=track, source="prefix", tool=prefix[0], observation=observation,
@@ -645,27 +607,12 @@ class OMTPObserver:
         for name in baseline_step["committed_tool_types"]:
             self.natural_available_by_tool.setdefault(name, available)
 
-    def method_events(self) -> dict[str, list[dict[str, Any]]]:
-        """Return causal online events for comparison methods C--F."""
+    def fallback_events(self) -> list[dict[str, Any]]:
+        """Return the immutable first online event for every tracked occurrence."""
 
-        whole_set = [
-            {
-                "source": "whole_set_argmax_stable",
-                "track_id": None,
-                "predicted_tools": event.tool_types,
-                "forward_step": event.forward_index,
-                "predict_time_s": event.available_time_s or event.time_s,
-            }
-            for event in self.baseline.stable_events
-        ]
-        return {
-            "whole_set_argmax_stable_n2": whole_set,
-            "per_tool_argmax_stable_n2": list(self.per_tool_argmax_events),
-            "omtp_latent_region_n2": list(self.latent_events),
-            "omtp_with_fallback": sorted(
-                self.fallback_commits.values(), key=lambda x: x["predict_time_s"]
-            ),
-        }
+        return sorted(
+            self.fallback_commits.values(), key=lambda event: event["predict_time_s"]
+        )
 
 
 __all__ = ["OMTPConfig", "OMTPObserver", "_json_object_depth"]

@@ -83,6 +83,7 @@ class ToolCallObserver:
         stable_n: int = 2,
         top_k: int = 1,
         full_logits_dir: Optional[str | Path] = None,
+        enable_stable_prediction: bool = True,
     ) -> None:
         if stable_n not in (1, 2, 3):
             raise ValueError("stable_n must be 1, 2, or 3")
@@ -92,6 +93,7 @@ class ToolCallObserver:
         self.candidate_names = list(candidate_names)
         self.stable_n = stable_n
         self.top_k = top_k
+        self.enable_stable_prediction = enable_stable_prediction
         self.steps: list[dict[str, Any]] = []
         self.stable_events: list[OnlineStableEvent] = []
         self.first_natural_by_tool: dict[str, float] = {}
@@ -148,31 +150,34 @@ class ToolCallObserver:
         for name in predicted_types:
             self.first_predict_by_tool.setdefault(name, observation.elapsed_s)
 
-        if predicted_set == self._previous_predicted_set:
-            self._stable_run += 1
-        else:
-            self._stable_run = 1
-            self._previous_predicted_set = predicted_set
         stable_trigger = False
-        if (
-            predicted_set
-            and self._stable_run >= self.stable_n
-            and predicted_set != self._last_emitted_set
-        ):
-            stable_trigger = True
-            self._last_emitted_set = predicted_set
-            self.stable_events.append(
-                OnlineStableEvent(
-                    observation.forward_index,
-                    observation.elapsed_s,
-                    sorted(predicted_set),
+        if self.enable_stable_prediction:
+            if predicted_set == self._previous_predicted_set:
+                self._stable_run += 1
+            else:
+                self._stable_run = 1
+                self._previous_predicted_set = predicted_set
+            if (
+                predicted_set
+                and self._stable_run >= self.stable_n
+                and predicted_set != self._last_emitted_set
+            ):
+                stable_trigger = True
+                self._last_emitted_set = predicted_set
+                self.stable_events.append(
+                    OnlineStableEvent(
+                        observation.forward_index,
+                        observation.elapsed_s,
+                        sorted(predicted_set),
+                    )
                 )
-            )
 
         step: dict[str, Any] = {
             "forward_index": observation.forward_index,
             "block_index": observation.block_index,
             "block_step": observation.block_step,
+            "cache_mode": observation.cache_mode,
+            "observation_sequence_offset": observation.sequence_offset,
             "forward_complete_time_s": observation.elapsed_s,
             "commit_complete_time_s": observation.commit_elapsed_s,
             "forward_time_s": observation.forward_time_s,

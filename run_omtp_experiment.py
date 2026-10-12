@@ -1,4 +1,4 @@
-"""Run BFCL parallel_multiple with A--F online multi-tool predictors."""
+"""Run BFCL parallel_multiple with the fixed OMTP + fallback policy."""
 
 from __future__ import annotations
 
@@ -14,9 +14,11 @@ import torch
 
 from bfcl_data import BFCLSample, iter_samples, validate_dataset
 from evaluation import evaluate_final_calls
-from omtp_evaluation import METHODS, evaluate_omtp
+from omtp_evaluation import (
+    METHOD_NAME, NATURAL_BASELINE_NAME, evaluate_omtp_fallback,
+)
 from omtp_observer import OMTPConfig, OMTPObserver
-from optimized_omtp_observer import OptimizedOMTPObserver, SelectiveOMTPObserver
+from optimized_omtp_observer import OptimizedOMTPObserver
 from omtp_report import build_omtp_report
 from prompting import render_prompt
 from run_experiment import (
@@ -38,6 +40,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--block-length", type=int, default=128)
     parser.add_argument("--steps", type=int, default=32)
     parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument(
+        "--cache-mode", choices=("none", "dual"), default="none",
+        help="Fast-dLLM v1 generation path; OMTP itself is unchanged.",
+    )
     parser.add_argument("--seed", type=int, default=20261009)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--dtype", choices=("bfloat16", "float16", "float32"), default="bfloat16")
@@ -51,15 +57,8 @@ def parse_args() -> argparse.Namespace:
         "--profile-observer", action="store_true",
         help="Synchronize at OMTP module boundaries and record a diagnostic profile.",
     )
-    parser.add_argument(
-        "--observer-mode", choices=("original", "optimized", "selective"),
-        default="original",
-    )
     parser.add_argument("--min-top1-score", type=float, default=None)
     parser.add_argument("--min-margin", type=float, default=None)
-    parser.add_argument("--disable-prefix-fallback", action="store_true")
-    parser.add_argument("--selective-refine-margin", type=float, default=0.5)
-    parser.add_argument("--selective-refine-top1", type=float, default=-4.0)
     return parser.parse_args()
 
 
@@ -76,18 +75,7 @@ def _run_sample(
     if prompt_ids.shape[1] + args.gen_length > getattr(model.config, "max_sequence_length", 4096):
         raise ValueError(f"{sample.sample_id}: prompt plus generation exceeds context")
     mask_id = getattr(model.config, "mask_token_id", None) or 126336
-    observer_class = {
-        "original": OMTPObserver,
-        "optimized": OptimizedOMTPObserver,
-        "selective": SelectiveOMTPObserver,
-    }[args.observer_mode]
-    observer_kwargs = {}
-    if args.observer_mode == "selective":
-        observer_kwargs.update({
-            "selective_refine_margin": args.selective_refine_margin,
-            "selective_refine_top1": args.selective_refine_top1,
-        })
-    observer = observer_class(
+    observer = OptimizedOMTPObserver(
         tokenizer=tokenizer,
         candidate_names=sample.candidate_names,
         stable_n=args.stable_n,
@@ -99,10 +87,8 @@ def _run_sample(
             min_support=args.min_support,
             min_top1_score=args.min_top1_score,
             min_margin=args.min_margin,
-            prefix_fallback_enabled=not args.disable_prefix_fallback,
         ),
         profile_enabled=args.profile_observer,
-        **observer_kwargs,
     )
     sample_seed = args.seed + sample_index
     baseline_output = None
@@ -124,23 +110,31 @@ def _run_sample(
     parsed = parse_tool_calls(evaluated, sample.candidate_names)
     predicted_calls = parsed.calls if parsed.format_valid else []
     partial_names = extract_partial_names(evaluated, sample.candidate_names)
-    final_tools = ordered_unique(
-        [call["name"] for call in predicted_calls] if parsed.format_valid else partial_names
+    final_occurrences = (
+        [call["name"] for call in predicted_calls]
+        if parsed.format_valid else partial_names
     )
+    final_tools = ordered_unique(final_occurrences)
     gt_occurrences = [call["name"] for call in sample.ground_truth_calls]
-    online = evaluate_omtp(
+    online = evaluate_omtp_fallback(
         observer,
         final_tools=final_tools,
         ground_truth_tools=sample.ground_truth_tool_types,
+        final_occurrences=final_occurrences,
+        ground_truth_occurrences=gt_occurrences,
     )
-    omtp_gt = online["methods"]["omtp_latent_region_n2"]["vs_ground_truth"]
+    omtp_gt = online["vs_ground_truth"]
+    natural_gt = online["natural_baseline"]["vs_ground_truth"]
     record = {
         "sample_id": sample.sample_id,
-        "observer_mode": args.observer_mode,
+        "method": METHOD_NAME,
+        "cache_mode": args.cache_mode,
+        "observer_implementation": "optimized",
         "candidate_tools": sample.candidate_names,
         "final_tools": final_tools,
         "ground_truth_tools": sorted(sample.ground_truth_tool_types),
         "ground_truth_tool_occurrences": gt_occurrences,
+        "final_tool_occurrences": final_occurrences,
         "generated_tool_calls": predicted_calls,
         "raw_output": raw_output,
         "evaluated_output_before_eos": evaluated,
@@ -150,7 +144,7 @@ def _run_sample(
         "final_json_error": parsed.error,
         **evaluate_final_calls(sample, predicted_calls),
         "omtp_events": observer.events,
-        "per_tool_argmax_events": observer.per_tool_argmax_events,
+        "omtp_fallback_events": online["events"],
         "per_tool_predictions": online["per_tool_predictions"],
         "natural_detection_times": online["natural_detection_times"],
         "generation_time_s": generation_time,
@@ -158,9 +152,42 @@ def _run_sample(
         "omtp_tool_recall": omtp_gt["tool_recall"],
         "omtp_tool_f1": omtp_gt["tool_f1"],
         "omtp_tool_set_exact_match": omtp_gt["tool_set_exact_match"],
+        "all_tool_types_prefetched": omtp_gt["all_tool_types_prefetched"],
+        "all_tool_types_prefetched_time_s": omtp_gt[
+            "oracle_all_correct_coverage_time_s"
+        ],
         "first_correct_prediction_time_s": omtp_gt["oracle_first_correct_prediction_time_s"],
         "all_correct_prediction_time_s": omtp_gt["oracle_exact_set_time_s"],
-        "method_comparison": online["methods"],
+        "natural_first_detection_time_s": natural_gt[
+            "oracle_first_correct_prediction_time_s"
+        ],
+        "natural_all_detection_time_s": natural_gt["oracle_exact_set_time_s"],
+        "natural_all_tool_types_detection_time_s": natural_gt[
+            "oracle_all_correct_coverage_time_s"
+        ],
+        "omtp_lead_vs_natural_s": omtp_gt[
+            "paired_exact_set_lead_vs_natural_s"
+        ],
+        "all_tool_occurrences_prefetched": omtp_gt[
+            "all_tool_occurrences_prefetched"
+        ],
+        "tool_occurrence_multiset_exact_match": omtp_gt[
+            "tool_occurrence_multiset_exact_match"
+        ],
+        "position_accuracy": omtp_gt["position_accuracy"],
+        "position_exact_match": omtp_gt["position_exact_match"],
+        "all_occurrences_prediction_time_s": omtp_gt[
+            "oracle_all_occurrences_covered_time_s"
+        ],
+        "all_occurrences_lead_vs_natural_s": omtp_gt[
+            "paired_all_occurrences_lead_vs_natural_s"
+        ],
+        "omtp_evaluation": {
+            "vs_final": online["vs_final"],
+            "vs_ground_truth": online["vs_ground_truth"],
+        },
+        "natural_baseline": online["natural_baseline"],
+        "position_comparison": online["position_comparison"],
         "forward_count": nfe,
         "model_forward_time_s": sum(step["forward_time_s"] for step in observer.steps),
         "observer_processing_time_s": observer.total_processing_s,
@@ -200,8 +227,9 @@ def _metadata(args: argparse.Namespace, output: Path, device: torch.device) -> N
         "answers_sha256": _sha256(args.answers),
         "dataset_validation": validate_dataset(args.questions, args.answers),
         "algorithm": {
-            "name": "OMTP",
-            "observer_mode": args.observer_mode,
+            "name": "OMTP+fallback",
+            "cache_mode": args.cache_mode,
+            "observer_implementation": "optimized",
             "anchor": "JSON name logits anchor, outer tool-call object only",
             "score": "candidate mean log-probability, region top-2 mean",
             "online_parameters": {
@@ -211,6 +239,8 @@ def _metadata(args: argparse.Namespace, output: Path, device: torch.device) -> N
             },
             "ground_truth_used_online": False,
             "extra_model_forwards_per_request": 0,
+            "fallback_policy": "first event per occurrence track; latent_region, then unique prefix, then natural",
+            "analysis_baseline": NATURAL_BASELINE_NAME,
         },
         "timing_semantics": "All times start before generation canvas construction (including prompt processing by model); OMTP trigger timestamps are sampled after the causal detection/scoring work that produced the event. CUDA model/transfer work is synchronized by the existing callback path.",
         "parity_method": "For selected samples: unmeasured observer-off warmup, measured observer-off run, measured observer-on run with identical seed.",
@@ -221,7 +251,8 @@ def _metadata(args: argparse.Namespace, output: Path, device: torch.device) -> N
 def _runtime_failure_record(sample: BFCLSample, error: Exception) -> dict[str, Any]:
     def empty_result() -> dict[str, Any]:
         return {
-            "predicted_tools": [], "tool_precision": 0.0, "tool_recall": 0.0,
+            "predicted_tools": [], "all_tool_types_prefetched": False,
+            "tool_precision": 0.0, "tool_recall": 0.0,
             "tool_f1": 0.0, "tool_set_exact_match": False,
             "false_positive_count": 0,
             "false_negative_count": len(sample.ground_truth_tool_types),
@@ -234,15 +265,29 @@ def _runtime_failure_record(sample: BFCLSample, error: Exception) -> dict[str, A
             "oracle_exact_set_time_s": None,
             "first_times_by_tool": {}, "trigger_count": 0,
             "paired_exact_set_lead_vs_natural_s": None,
+            "predicted_tool_occurrences": [],
+            "expected_tool_occurrences": [],
+            "occurrence_precision": 0.0, "occurrence_recall": 0.0,
+            "occurrence_f1": 0.0,
+            "all_tool_occurrences_prefetched": False,
+            "tool_occurrence_count_match": False,
+            "tool_occurrence_multiset_exact_match": False,
+            "oracle_all_occurrences_covered_time_s": None,
+            "oracle_exact_occurrence_multiset_time_s": None,
+            "natural_all_occurrences_covered_time_s": None,
+            "paired_all_occurrences_lead_vs_natural_s": None,
+            "position_correct_count": 0, "position_total": 0,
+            "position_accuracy": 0.0, "position_exact_match": False,
+            "position_records": [],
         }
-    comparison = {
-        method: {"events": [], "vs_final": empty_result(), "vs_ground_truth": empty_result()}
-        for method in METHODS
-    }
     message = f"{type(error).__name__}: {error}"
     return {
-        "sample_id": sample.sample_id, "candidate_tools": sample.candidate_names,
+        "sample_id": sample.sample_id, "method": METHOD_NAME,
+        "cache_mode": None,
+        "observer_implementation": "optimized",
+        "candidate_tools": sample.candidate_names,
         "final_tools": [], "ground_truth_tools": sorted(sample.ground_truth_tool_types),
+        "final_tool_occurrences": [],
         "ground_truth_tool_occurrences": [call["name"] for call in sample.ground_truth_calls],
         "generated_tool_calls": [], "raw_output": "", "evaluated_output_before_eos": "",
         "final_json_valid": False, "tool_call_format_valid": False,
@@ -251,17 +296,39 @@ def _runtime_failure_record(sample: BFCLSample, error: Exception) -> dict[str, A
         "tool_set_exact_match": False, "tool_type_precision": 0.0,
         "tool_type_recall": 0.0, "tool_type_f1": 0.0,
         "tool_call_count_match": False, "bfcl_ast_compatible_match": False,
-        "omtp_events": [], "per_tool_argmax_events": [], "per_tool_predictions": [],
+        "omtp_events": [], "omtp_fallback_events": [], "per_tool_predictions": [],
         "natural_detection_times": {}, "generation_time_s": None,
         "omtp_tool_precision": 0.0, "omtp_tool_recall": 0.0, "omtp_tool_f1": 0.0,
         "omtp_tool_set_exact_match": False, "first_correct_prediction_time_s": None,
-        "all_correct_prediction_time_s": None, "method_comparison": comparison,
+        "all_tool_types_prefetched": False,
+        "all_tool_types_prefetched_time_s": None,
+        "all_correct_prediction_time_s": None,
+        "natural_first_detection_time_s": None,
+        "natural_all_detection_time_s": None,
+        "natural_all_tool_types_detection_time_s": None,
+        "omtp_lead_vs_natural_s": None,
+        "all_tool_occurrences_prefetched": False,
+        "tool_occurrence_multiset_exact_match": False,
+        "position_accuracy": 0.0, "position_exact_match": False,
+        "all_occurrences_prediction_time_s": None,
+        "all_occurrences_lead_vs_natural_s": None,
+        "omtp_evaluation": {
+            "vs_final": empty_result(),
+            "vs_ground_truth": empty_result(),
+        },
+        "natural_baseline": {
+            "method": NATURAL_BASELINE_NAME, "events": [],
+            "vs_final": empty_result(),
+            "vs_ground_truth": empty_result(),
+        },
+        "position_comparison": {"vs_final": [], "vs_ground_truth": []},
         "forward_count": None, "model_forward_time_s": None,
         "observer_processing_time_s": None, "observer_mean_processing_time_s": None,
         "omtp_processing_time_s": None, "observer_off_generation_time_s": None,
         "observer_output_identical": None, "observer_nfe_identical": None,
         "observer_wall_overhead_ratio": None, "prompt_token_count": None,
-        "runtime_error": message, "steps": [], "omtp_trajectory": [],
+        "observer_profile": {}, "runtime_error": message, "steps": [],
+        "omtp_trajectory": [],
     }
 
 
@@ -279,7 +346,9 @@ def main() -> None:
     protected = (
         "samples.jsonl", "steps.jsonl", "failures.jsonl", "metadata.json",
         "omtp_events.jsonl", "omtp_trajectory.jsonl", "omtp_samples.jsonl",
-        "omtp_summary.csv", "omtp_comparison.csv",
+        "omtp_fallback_events.jsonl", "natural_events.jsonl",
+        "position_records.jsonl", "omtp_position_summary.csv",
+        "omtp_summary.csv", "omtp_comparison.csv", "omtp_diagnostics.csv",
     )
     for name in protected:
         if (output / name).exists():
@@ -291,6 +360,8 @@ def main() -> None:
     samples = list(iter_samples(args.questions, args.answers, limit=args.limit, start=args.start))
     paths = {name: (output / name).open("w", encoding="utf-8") for name in (
         "samples.jsonl", "steps.jsonl", "failures.jsonl", "omtp_events.jsonl",
+        "omtp_fallback_events.jsonl", "natural_events.jsonl",
+        "position_records.jsonl",
         "omtp_trajectory.jsonl", "omtp_samples.jsonl",
     )}
     try:
@@ -304,6 +375,7 @@ def main() -> None:
                 paths["failures.jsonl"].flush()
                 print(f"  FAILED: {failure['error']}", file=sys.stderr, flush=True)
                 record = _runtime_failure_record(sample, error)
+                record["cache_mode"] = args.cache_mode
                 serialized = json.dumps(record, ensure_ascii=False) + "\n"
                 paths["samples.jsonl"].write(serialized)
                 paths["omtp_samples.jsonl"].write(serialized)
@@ -315,6 +387,17 @@ def main() -> None:
                 paths["steps.jsonl"].write(json.dumps({"sample_id": sample.sample_id, **step}, ensure_ascii=False) + "\n")
             for event in observer.events:
                 paths["omtp_events.jsonl"].write(json.dumps({"sample_id": sample.sample_id, **event}, ensure_ascii=False) + "\n")
+            for event in record["omtp_fallback_events"]:
+                paths["omtp_fallback_events.jsonl"].write(json.dumps({"sample_id": sample.sample_id, **event}, ensure_ascii=False) + "\n")
+            for event in record["natural_baseline"]["events"]:
+                paths["natural_events.jsonl"].write(json.dumps({"sample_id": sample.sample_id, **event}, ensure_ascii=False) + "\n")
+            for reference, rows in record["position_comparison"].items():
+                for row in rows:
+                    paths["position_records.jsonl"].write(json.dumps({
+                        "sample_id": sample.sample_id,
+                        "reference": reference,
+                        **row,
+                    }, ensure_ascii=False) + "\n")
             for row in observer.trajectory:
                 paths["omtp_trajectory.jsonl"].write(json.dumps({"sample_id": sample.sample_id, **row}, ensure_ascii=False) + "\n")
             failures = []

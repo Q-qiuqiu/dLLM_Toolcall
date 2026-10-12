@@ -19,7 +19,7 @@ import torch
 
 from bfcl_data import BFCLSample, iter_samples, validate_dataset
 from evaluation import analyze_observer, evaluate_final_calls
-from fastdllm_generate import generate
+from fastdllm_generate import generate, generate_with_dual_cache
 from observer import ToolCallObserver
 from prompting import render_prompt
 from report import build_summary
@@ -138,7 +138,14 @@ def _generate_once(
     _sync(device)
     started = time.perf_counter()
     with torch.inference_mode():
-        output, nfe = generate(
+        cache_mode = getattr(args, "cache_mode", "none")
+        generate_fn = {
+            "none": generate,
+            "dual": generate_with_dual_cache,
+        }.get(cache_mode)
+        if generate_fn is None:
+            raise ValueError(f"unsupported cache mode: {cache_mode}")
+        output, nfe = generate_fn(
             model=model,
             prompt=prompt_ids,
             steps=args.steps,

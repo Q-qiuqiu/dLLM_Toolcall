@@ -1,9 +1,10 @@
-"""Fast-dLLM v1 no-cache LLaDA generation with an optional observer hook.
+"""Fast-dLLM v1 LLaDA generation with optional observer hooks.
 
 The sampling and token-transfer code is copied from
 ``Fast-dLLM/v1/llada/generate.py`` at repository commit
-``aadcf060e12b6413b494bf9aebb172cfe3cf911c``.  The only behavioral extension
-is ``observation_callback``.  When it is ``None`` (the default), no timing,
+``aadcf060e12b6413b494bf9aebb172cfe3cf911c``.  Both No Cache and Dual Cache
+keep the original token-transfer rules; the only behavioral extension is
+``observation_callback``.  When it is ``None`` (the default), no timing,
 device synchronization, decoding, or tensor copy is added to the generation
 loop.
 """
@@ -35,6 +36,11 @@ class ForwardObservation:
     x: torch.Tensor
     committed_x: torch.Tensor
     logits: torch.Tensor
+    # Global sequence offset represented by the local x/logits tensors.  It is
+    # zero for no-cache full-sequence observations and prompt_length for the
+    # single-block Dual Cache observation view.
+    sequence_offset: int = 0
+    cache_mode: str = "none"
 
 
 ObservationCallback = Callable[[ForwardObservation], None]
@@ -295,10 +301,222 @@ def generate(
     return x, nfe
 
 
+@torch.no_grad()
+def generate_with_dual_cache(
+    model,
+    prompt: torch.Tensor,
+    steps: int = 128,
+    gen_length: int = 128,
+    block_length: int = 128,
+    temperature: float = 0.0,
+    remasking: str = "low_confidence",
+    mask_id: int = 126336,
+    threshold: Optional[float] = None,
+    factor: Optional[float] = None,
+    observation_callback: Optional[ObservationCallback] = None,
+) -> tuple[torch.Tensor, int]:
+    """Fast-dLLM v1 Dual Cache with a zero-extra-forward observer hook.
+
+    The decoding and cache update path mirrors
+    ``Fast-dLLM/v1/llada/generate.py::generate_with_dual_cache``.  The first
+    step builds a full-sequence KV cache; later steps evaluate only the current
+    generation block with ``replace_position``.  For the fixed OMTP global
+    denoising experiment, the one current block is the complete generation
+    region, so every callback still receives logits for all generated tokens.
+
+    To avoid allocating a mostly unused full logits tensor for the observer,
+    callback tensors use a generation-local coordinate system: ``x`` and
+    ``logits`` both have ``gen_length`` positions, ``prompt_length`` is zero,
+    and ``sequence_offset`` records the true prompt length.  No additional
+    model forward is performed.
+    """
+
+    if prompt.ndim != 2 or prompt.shape[0] != 1:
+        raise ValueError("This experiment requires batch_size=1")
+    if gen_length % block_length:
+        raise ValueError("gen_length must be divisible by block_length")
+    num_blocks = gen_length // block_length
+    if steps % num_blocks:
+        raise ValueError("steps must be divisible by the number of blocks")
+    if observation_callback is not None and num_blocks != 1:
+        raise ValueError(
+            "OMTP Dual Cache observation currently requires global denoising "
+            "(block_length == gen_length)"
+        )
+    steps_per_block = steps // num_blocks
+    prompt_length = int(prompt.shape[1])
+    generation_start = time.perf_counter()
+    x = torch.full(
+        (prompt.shape[0], prompt_length + gen_length),
+        mask_id,
+        dtype=torch.long,
+        device=model.device,
+    )
+    x[:, :prompt_length] = prompt.clone()
+    nfe = 0
+
+    for block_index in range(num_blocks):
+        block_start = prompt_length + block_index * block_length
+        block_end = block_start + block_length
+        block_mask = x[:, block_start:block_end] == mask_id
+        num_transfer_tokens = get_num_transfer_tokens(
+            block_mask, steps_per_block
+        )
+
+        if observation_callback is None:
+            output = model(x, use_cache=True)
+            forward_start = forward_end = None
+            x_before = None
+        else:
+            _synchronize_for(x)
+            forward_start = time.perf_counter()
+            output = model(x, use_cache=True)
+            _synchronize_for(output.logits)
+            forward_end = time.perf_counter()
+            x_before = x[:, block_start:block_end].clone()
+        past_key_values = output.past_key_values
+        logits_block = output.logits[:, block_start:block_end, :]
+        nfe += 1
+
+        mask_block = x[:, block_start:block_end] == mask_id
+        if factor is None:
+            x0, transfer = get_transfer_index(
+                logits_block,
+                temperature,
+                remasking,
+                mask_block,
+                x[:, block_start:block_end],
+                num_transfer_tokens[:, 0] if threshold is None else None,
+                threshold,
+            )
+        else:
+            x0, transfer = get_transfer_index_dynamic(
+                logits_block,
+                temperature,
+                remasking,
+                mask_block,
+                x[:, block_start:block_end],
+                None,
+                factor,
+            )
+        block_new = torch.where(
+            transfer, x0, x[:, block_start:block_end]
+        )
+        x = torch.cat(
+            [x[:, :block_start], block_new, x[:, block_end:]], dim=1
+        )
+        if observation_callback is not None:
+            _synchronize_for(x)
+            commit_end = time.perf_counter()
+            observation_callback(ForwardObservation(
+                forward_index=nfe,
+                block_index=block_index,
+                block_step=0,
+                elapsed_s=forward_end - generation_start,
+                commit_elapsed_s=commit_end - generation_start,
+                forward_time_s=forward_end - forward_start,
+                prompt_length=0,
+                block_start=0,
+                block_end=block_length,
+                mask_id=mask_id,
+                x=x_before,
+                committed_x=x[:, block_start:block_end].clone(),
+                logits=logits_block,
+                sequence_offset=block_start,
+                cache_mode="dual",
+            ))
+        del output
+
+        replace_position = torch.zeros_like(x, dtype=torch.bool)
+        replace_position[:, block_start:block_end] = True
+        for block_step in range(1, steps_per_block):
+            if (x[:, block_start:block_end] == mask_id).sum() == 0:
+                break
+            if observation_callback is None:
+                logits_block = model(
+                    x[:, block_start:block_end],
+                    past_key_values=past_key_values,
+                    use_cache=True,
+                    replace_position=replace_position,
+                ).logits
+                forward_start = forward_end = None
+                x_before = None
+            else:
+                _synchronize_for(x)
+                forward_start = time.perf_counter()
+                cached_output = model(
+                    x[:, block_start:block_end],
+                    past_key_values=past_key_values,
+                    use_cache=True,
+                    replace_position=replace_position,
+                )
+                logits_block = cached_output.logits
+                _synchronize_for(logits_block)
+                forward_end = time.perf_counter()
+                x_before = x[:, block_start:block_end].clone()
+                del cached_output
+            nfe += 1
+            mask_block = x[:, block_start:block_end] == mask_id
+            if factor is None:
+                x0, transfer = get_transfer_index(
+                    logits_block,
+                    temperature,
+                    remasking,
+                    mask_block,
+                    x[:, block_start:block_end],
+                    num_transfer_tokens[:, block_step]
+                    if threshold is None else None,
+                    threshold,
+                )
+            else:
+                x0, transfer = get_transfer_index_dynamic(
+                    logits_block,
+                    temperature,
+                    remasking,
+                    mask_block,
+                    x[:, block_start:block_end],
+                    None,
+                    factor,
+                )
+            block_new = torch.where(
+                transfer, x0, x[:, block_start:block_end]
+            )
+            x = torch.cat(
+                [x[:, :block_start], block_new, x[:, block_end:]], dim=1
+            )
+            if observation_callback is not None:
+                _synchronize_for(x)
+                commit_end = time.perf_counter()
+                observation_callback(ForwardObservation(
+                    forward_index=nfe,
+                    block_index=block_index,
+                    block_step=block_step,
+                    elapsed_s=forward_end - generation_start,
+                    commit_elapsed_s=commit_end - generation_start,
+                    forward_time_s=forward_end - forward_start,
+                    prompt_length=0,
+                    block_start=0,
+                    block_end=block_length,
+                    mask_id=mask_id,
+                    x=x_before,
+                    committed_x=x[:, block_start:block_end].clone(),
+                    logits=logits_block,
+                    sequence_offset=block_start,
+                    cache_mode="dual",
+                ))
+        if (x[:, block_start:block_end] == mask_id).any():
+            raise RuntimeError(
+                "block still contains MASK after its configured Dual Cache steps"
+            )
+        del past_key_values
+    return x, nfe
+
+
 __all__ = [
     "ForwardObservation",
     "ObservationCallback",
     "generate",
+    "generate_with_dual_cache",
     "get_num_transfer_tokens",
     "get_transfer_index",
 ]

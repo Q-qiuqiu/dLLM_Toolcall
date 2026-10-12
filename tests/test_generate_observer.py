@@ -2,7 +2,7 @@ from types import SimpleNamespace
 
 import torch
 
-from fastdllm_generate import generate
+from fastdllm_generate import generate, generate_with_dual_cache
 
 
 class FakeModel:
@@ -17,6 +17,30 @@ class FakeModel:
             token = 3 + position
             logits[:, position, token] = 10.0 + position
         return SimpleNamespace(logits=logits)
+
+
+class DualFakeModel:
+    """Position-independent logits make cache/no-cache parity unambiguous."""
+
+    def __init__(self):
+        self.device = torch.device("cpu")
+
+    def __call__(
+        self, x, past_key_values=None, use_cache=False,
+        replace_position=None,
+    ):
+        del replace_position
+        batch, length = x.shape
+        logits = torch.full((batch, length, 32), -10.0)
+        logits[:, :, 7] = 10.0
+        cache_length = length
+        if past_key_values is not None:
+            cache_length += int(past_key_values[0][0].shape[2])
+        cache = ((torch.zeros(batch, 1, cache_length, 1),),)
+        return SimpleNamespace(
+            logits=logits,
+            past_key_values=cache if use_cache else None,
+        )
 
 
 def test_observer_off_and_on_produce_identical_tokens():
@@ -64,3 +88,30 @@ def test_block_metadata_and_forward_count():
         (1, 0),
         (1, 1),
     ]
+
+
+def test_dual_cache_matches_no_cache_without_extra_forwards():
+    model = DualFakeModel()
+    prompt = torch.tensor([[1, 2, 3]])
+    baseline, baseline_nfe = generate(
+        model, prompt, steps=4, gen_length=8, block_length=8, mask_id=31
+    )
+    observations = []
+    cached, cached_nfe = generate_with_dual_cache(
+        model,
+        prompt,
+        steps=4,
+        gen_length=8,
+        block_length=8,
+        mask_id=31,
+        observation_callback=observations.append,
+    )
+    assert torch.equal(cached, baseline)
+    assert baseline_nfe == cached_nfe == len(observations) == 4
+    assert all(row.logits.shape[1] == 8 for row in observations)
+    assert all(row.x.shape[1] == 8 for row in observations)
+    assert all(row.committed_x.shape[1] == 8 for row in observations)
+    assert all(row.prompt_length == 0 for row in observations)
+    assert all(row.sequence_offset == 3 for row in observations)
+    assert all(row.cache_mode == "dual" for row in observations)
+    assert [row.block_step for row in observations] == [0, 1, 2, 3]

@@ -2,10 +2,12 @@ import torch
 import json
 
 from fastdllm_generate import ForwardObservation
-from omtp_evaluation import evaluate_omtp
+from omtp_evaluation import (
+    METHOD_NAME, evaluate_events, evaluate_occurrences, evaluate_omtp_fallback,
+)
 from omtp_observer import OMTPObserver, _json_object_depth
 from omtp_report import build_omtp_report
-from optimized_omtp_observer import OptimizedOMTPObserver, SelectiveOMTPObserver
+from optimized_omtp_observer import OptimizedOMTPObserver
 
 
 class CharacterTokenizer:
@@ -31,6 +33,33 @@ def test_json_depth_rejects_nested_argument_name():
     assert _json_object_depth('[{"name":"x","arguments":{"name":') == 2
 
 
+def test_occurrence_metrics_do_not_collapse_duplicates_or_positions():
+    events = [
+        {"predicted_tool": "b", "best_position": 10, "track_id": 0,
+         "predict_time_s": 1.0, "forward_step": 2, "source": "latent_region"},
+        {"predicted_tool": "a", "best_position": 20, "track_id": 1,
+         "predict_time_s": 1.2, "forward_step": 3, "source": "latent_region"},
+    ]
+    swapped = evaluate_occurrences(events, ["a", "b"])
+    assert swapped["tool_occurrence_multiset_exact_match"]
+    assert swapped["position_accuracy"] == 0.0
+    assert not swapped["position_exact_match"]
+
+    missing_duplicate = evaluate_occurrences(events, ["a", "a", "b"])
+    assert not missing_duplicate["all_tool_occurrences_prefetched"]
+    assert missing_duplicate["occurrence_recall"] == 2 / 3
+
+
+def test_broad_tool_type_coverage_ignores_counts_and_allows_extras():
+    events = [
+        {"predicted_tool": tool, "predict_time_s": index + 1.0}
+        for index, tool in enumerate(("weather", "air", "unneeded"))
+    ]
+    result = evaluate_events(events, {"weather", "air"})
+    assert result["all_tool_types_prefetched"]
+    assert not result["tool_set_exact_match"]
+
+
 def test_omtp_tracks_occurrences_and_stable_commits_without_mutation():
     target = '[{"name":"weather","arguments":{"name":"x"}},{"name":"weather","arguments":{}}]'
     tokenizer = CharacterTokenizer(target)
@@ -40,7 +69,8 @@ def test_omtp_tracks_occurrences_and_stable_commits_without_mutation():
     for forward in (1, 2, 3):
         before = torch.full((1, len(target_ids)), mask_id, dtype=torch.long)
         after = before.clone()
-        after[:, :forward] = target_ids[:forward]
+        committed = len(target_ids) if forward == 3 else forward
+        after[:, :committed] = target_ids[:committed]
         logits = torch.full((1, len(target_ids), vocab), -8.0)
         logits[0, torch.arange(len(target_ids)), target_ids] = 8.0
         snapshot = after.clone()
@@ -57,14 +87,25 @@ def test_omtp_tracks_occurrences_and_stable_commits_without_mutation():
     assert all(event["forward_step"] == 3 for event in observer.latent_events)
     # The nested arguments.name field must not create a third occurrence track.
     assert len({event["track_id"] for event in observer.latent_events}) == 2
-    assert observer.per_tool_argmax_events[0]["forward_step"] == 2
-
-    evaluated = evaluate_omtp(
-        observer, final_tools=["weather"], ground_truth_tools=["weather"]
+    assert observer.baseline.stable_events == []
+    evaluated = evaluate_omtp_fallback(
+        observer, final_tools=["weather"], ground_truth_tools=["weather"],
+        final_occurrences=["weather", "weather"],
+        ground_truth_occurrences=["weather", "weather"],
     )
-    latent = evaluated["methods"]["omtp_latent_region_n2"]["vs_ground_truth"]
-    assert latent["tool_set_exact_match"]
-    assert latent["tool_precision"] == latent["tool_recall"] == 1.0
+    result = evaluated["vs_ground_truth"]
+    assert evaluated["method"] == METHOD_NAME
+    assert result["tool_set_exact_match"]
+    assert result["tool_precision"] == result["tool_recall"] == 1.0
+    assert result["all_tool_occurrences_prefetched"]
+    assert result["tool_occurrence_multiset_exact_match"]
+    assert result["position_accuracy"] == 1.0
+    assert result["position_exact_match"]
+    assert evaluated["events"] == observer.fallback_events()
+    natural = evaluated["natural_baseline"]
+    assert natural["method"] == "natural_decoding"
+    assert natural["events"][0]["forward_step"] == 3
+    assert natural["vs_ground_truth"]["tool_set_exact_match"]
 
 
 def test_optimized_omtp_preserves_original_events():
@@ -100,7 +141,7 @@ def test_confidence_gate_can_disable_latent_trigger():
     target = '[{"name":"weather","arguments":{}}]'
     tokenizer = CharacterTokenizer(target)
     target_ids = torch.tensor(tokenizer.encode(target))
-    observer = SelectiveOMTPObserver(
+    observer = OptimizedOMTPObserver(
         tokenizer=tokenizer, candidate_names=["weather"], stable_n=2,
         config=OMTPConfig(stable_n=2, min_top1_score=0.1),
     )
@@ -120,7 +161,8 @@ def test_confidence_gate_can_disable_latent_trigger():
 
 def test_omtp_report_writes_all_artifacts(tmp_path):
     result = {
-        "predicted_tools": ["weather"], "tool_precision": 1.0,
+        "predicted_tools": ["weather"], "all_tool_types_prefetched": True,
+        "tool_precision": 1.0,
         "tool_recall": 1.0, "tool_f1": 1.0, "tool_set_exact_match": True,
         "false_positive_count": 0, "false_negative_count": 0,
         "false_positives": [], "false_negatives": [],
@@ -128,17 +170,49 @@ def test_omtp_report_writes_all_artifacts(tmp_path):
         "oracle_first_correct_prediction_time_s": 1.0,
         "oracle_all_correct_coverage_time_s": 1.0,
         "oracle_exact_set_time_s": 1.0,
+        "natural_exact_set_time_s": 3.0,
         "paired_exact_set_lead_vs_natural_s": 2.0,
         "first_times_by_tool": {"weather": 1.0}, "trigger_count": 1,
+        "occurrence_precision": 1.0, "occurrence_recall": 1.0,
+        "occurrence_f1": 1.0, "all_tool_occurrences_prefetched": True,
+        "tool_occurrence_count_match": True,
+        "tool_occurrence_multiset_exact_match": True,
+        "position_accuracy": 1.0, "position_exact_match": True,
+        "oracle_all_occurrences_covered_time_s": 1.0,
+        "oracle_exact_occurrence_multiset_time_s": 1.0,
+        "natural_all_occurrences_covered_time_s": 3.0,
+        "paired_all_occurrences_lead_vs_natural_s": 2.0,
+        "position_records": [],
     }
     events = [{"source": "latent_region", "predicted_tool": "weather", "forward_step": 2, "predict_time_s": 1.0}]
-    methods = {}
-    from omtp_evaluation import METHODS
-    for method in METHODS:
-        methods[method] = {"events": events, "vs_final": result, "vs_ground_truth": result}
     sample = {
         "sample_id": "x", "ground_truth_tools": ["weather"],
-        "method_comparison": methods, "forward_count": 2,
+        "omtp_evaluation": {"vs_final": result, "vs_ground_truth": result},
+        "natural_baseline": {
+            "method": "natural_decoding", "events": events,
+            "vs_final": result, "vs_ground_truth": result,
+        },
+        "position_comparison": {
+            key: [{
+                "position": 1, "expected_tool": "weather",
+                "omtp_predicted_tool": "weather", "omtp_correct": True,
+                "omtp_predict_time_s": 1.0, "omtp_forward_step": 2,
+                "omtp_source": "latent_region", "omtp_track_id": 0,
+                "omtp_sequence_position": 4,
+                "natural_predicted_tool": "weather", "natural_correct": True,
+                "natural_detect_time_s": 3.0, "natural_forward_step": 3,
+                "lead_vs_natural_s": 2.0,
+            }]
+            for key in ("vs_final", "vs_ground_truth")
+        },
+        "omtp_fallback_events": events,
+        "per_tool_predictions": [{
+            "tool": "weather", "T_latent": 1.0, "T_prefix": None,
+            "T_natural": 3.0, "T_online": 1.0,
+            "latent_lead_vs_natural_s": 2.0,
+            "online_lead_vs_natural_s": 2.0,
+        }],
+        "forward_count": 2,
         "observer_processing_time_s": .1, "observer_mean_processing_time_s": .05,
         "omtp_processing_time_s": .04, "generation_time_s": 3.0,
         "observer_off_generation_time_s": 2.8,
@@ -149,4 +223,6 @@ def test_omtp_report_writes_all_artifacts(tmp_path):
     build_omtp_report(tmp_path)
     assert (tmp_path / "omtp_summary.csv").exists()
     assert (tmp_path / "omtp_comparison.csv").exists()
-    assert (tmp_path / "figures" / "method_precision_recall_f1.png").exists()
+    assert (tmp_path / "omtp_position_summary.csv").exists()
+    assert (tmp_path / "omtp_diagnostics.csv").exists()
+    assert (tmp_path / "figures" / "omtp_fallback_quality.png").exists()
