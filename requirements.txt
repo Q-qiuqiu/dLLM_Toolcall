@@ -1,0 +1,7 @@
+# Match the Fast-dLLM v1 environment for actual inference.
+transformers==4.49.0
+accelerate==0.34.2
+numpy
+torch
+matplotlib
+pytest
