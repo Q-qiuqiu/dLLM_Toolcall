@@ -1,9 +1,12 @@
+import argparse
 import json
 
 from json_repair_evaluation import evaluate_json_repair
 from prompting import build_messages
 from run_taskbench_experiment import FIXED, _fixed_runtime_args
-from taskbench_data import iter_taskbench_samples, validate_taskbench_manifest
+from taskbench_data import (
+    iter_taskbench_samples, load_tool_catalog, validate_taskbench_manifest,
+)
 from taskbench_evaluation import FALLBACK, LATENT, NATURAL, evaluate_taskbench_methods
 from taskbench_report import build_taskbench_report
 
@@ -54,6 +57,18 @@ def test_taskbench_adapter_uses_full_catalog_and_prompt_has_no_gt_leak(tmp_path)
     assert audit["candidate_tool_count"] == 3
 
 
+def test_resource_tool_catalog_preserves_special_names_and_positional_inputs(tmp_path):
+    catalog = tmp_path / "tool_desc.json"
+    catalog.write_text(json.dumps({"nodes": [{
+        "id": "Image Search (by Image)", "desc": "Find similar images",
+        "input-type": ["image"], "output-type": ["image"],
+    }]}), encoding="utf-8")
+    functions = load_tool_catalog(catalog)
+    assert functions[0]["name"] == "Image Search (by Image)"
+    assert functions[0]["parameters"]["required"] == ["input_1"]
+    assert functions[0]["parameters"]["properties"]["input_1"]["type"] == "string"
+
+
 def test_three_methods_are_separate_and_duplicate_calls_are_not_collapsed():
     natural = [
         _event("tool_a", 3.0, 10, "natural_decoding"),
@@ -87,6 +102,18 @@ def test_taskbench_cli_parameters_are_fixed():
     assert args.steps == 32 and args.stable_n == 2
     assert args.min_top1_score is None and args.min_margin is None
     assert FIXED["region_radius"] == 4 and FIXED["region_top_k"] == 2
+
+
+def test_taskbench_diagnostic_256_changes_only_generation_profile():
+    args = _fixed_runtime_args(argparse.Namespace(
+        generation_profile="diagnostic256", stable_marker="preserved"
+    ))
+    assert args.gen_length == args.block_length == 256
+    assert args.steps == 64
+    assert args.stable_n == 2
+    assert args.temperature == 0.0
+    assert args.seed == 20261009
+    assert args.stable_marker == "preserved"
 
 
 def test_json_repair_recovers_missing_separator(tmp_path):

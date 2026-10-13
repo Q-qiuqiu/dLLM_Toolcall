@@ -1,0 +1,157 @@
+{
+  "models": {
+    "whisper": {
+      "repo_id": "openai/whisper-tiny",
+      "revision": "169d4a4341b33bc18d8881c4b69c2e104e1cc0af",
+      "local_dir": "/data/home/yzx/dLLM_Toolcall/models/whisper-tiny",
+      "taskbench_tools": {
+        "data_huggingface": [
+          "Automatic Speech Recognition"
+        ],
+        "data_multimedia": [
+          "Audio-to-Text"
+        ]
+      },
+      "semantic_note": "Speech recognition / audio transcription.",
+      "file_count": 11,
+      "total_size_bytes": 155434424,
+      "files": [
+        {
+          "path": "added_tokens.json",
+          "size_bytes": 34604,
+          "sha256": "9715fd2243b6f06a5858b5e32950d2853f73dd5bc201aafcf76f5082a2d8acd1"
+        },
+        {
+          "path": "config.json",
+          "size_bytes": 1983,
+          "sha256": "ffdccec4f3211f4c63310f2b7098f309fe70f3952cedc5e4d11e43f5b2379b98"
+        },
+        {
+          "path": "generation_config.json",
+          "size_bytes": 3747,
+          "sha256": "a5d5325911f16e74001a72fa13d6e208eee51548f994646de1f4b4cc8b35b512"
+        },
+        {
+          "path": "merges.txt",
+          "size_bytes": 493869,
+          "sha256": "2df2990a395e35e8dfbc7511e08c12d56018d8d04691e0133e5d63b21e154dc6"
+        },
+        {
+          "path": "model.safetensors",
+          "size_bytes": 151061672,
+          "sha256": "7ebd0e69e78190ffe1438491fa05cc1f5c1aa3a4c4db3bc1723adbb551ea2395"
+        },
+        {
+          "path": "normalizer.json",
+          "size_bytes": 52666,
+          "sha256": "bf1c507dc8724ca9cf9903640dacfb69dae2f00edee4f21ceba106a7392f26dd"
+        },
+        {
+          "path": "preprocessor_config.json",
+          "size_bytes": 184990,
+          "sha256": "9b5cd03a36fbb8a627c64d98a5b5b126ead95a77720723944487311f0110b666"
+        },
+        {
+          "path": "special_tokens_map.json",
+          "size_bytes": 2194,
+          "sha256": "e67ae3a0aaa99abcd9f187138e12db1f65c16a14761c50ef10eef2c174a7a691"
+        },
+        {
+          "path": "tokenizer.json",
+          "size_bytes": 2480466,
+          "sha256": "27fc476bfe7f17299480be2273fc0608e4d5a99aba2ab5dec5374b4482d1a566"
+        },
+        {
+          "path": "tokenizer_config.json",
+          "size_bytes": 282683,
+          "sha256": "2a4c4281cf9f51ac6ccc406fdc711a087afe6530f671fa7b80953edc498275ce"
+        },
+        {
+          "path": "vocab.json",
+          "size_bytes": 835550,
+          "sha256": "8f680bba319e01a653d2e8a5dbc17a9157179e0576e6ce74ce0c06356c6e24f9"
+        }
+      ]
+    },
+    "vit": {
+      "repo_id": "google/vit-base-patch16-224",
+      "revision": "3f49326eb077187dfe1c2a2bb15fbd74e6ab91e3",
+      "local_dir": "/data/home/yzx/dLLM_Toolcall/models/vit-base-patch16-224",
+      "taskbench_tools": {
+        "data_huggingface": [
+          "Image Classification"
+        ]
+      },
+      "semantic_note": "ImageNet image classification.",
+      "file_count": 3,
+      "total_size_bytes": 346363677,
+      "files": [
+        {
+          "path": "config.json",
+          "size_bytes": 69665,
+          "sha256": "abdf73cc4ce79495a83f32a8c9265daa7a1363f5a3efa4704c88a6e7f45ad19d"
+        },
+        {
+          "path": "model.safetensors",
+          "size_bytes": 346293852,
+          "sha256": "1cea07110a4a47edc51420b2dda6f3b8b58e7256e8f44b4ea6aa9696162ccb5d"
+        },
+        {
+          "path": "preprocessor_config.json",
+          "size_bytes": 160,
+          "sha256": "90d1ae427c27d2b9dcb01f6a62ba96aa67aac2de1697c59cd212055b5035c4a2"
+        }
+      ]
+    },
+    "blip": {
+      "repo_id": "Salesforce/blip-image-captioning-base",
+      "revision": "82a37760796d32b1411fe092ab5d4e227313294b",
+      "local_dir": "/data/home/yzx/dLLM_Toolcall/models/blip-image-captioning-base",
+      "taskbench_tools": {
+        "data_huggingface": [
+          "Image-to-Text"
+        ]
+      },
+      "semantic_note": "Image captioning only. It is not a complete implementation of TaskBench Multimedia Image-to-Text, whose primary semantics are OCR.",
+      "file_count": 7,
+      "total_size_bytes": 990769234,
+      "files": [
+        {
+          "path": "config.json",
+          "size_bytes": 4563,
+          "sha256": "f7846f82f4e2c4a2ccbab9ae8b0e44873540a271a76a1288effd078180c13a82"
+        },
+        {
+          "path": "preprocessor_config.json",
+          "size_bytes": 287,
+          "sha256": "065c10ec97edc5081fbd9655b3d9d25e2647ea6d5dab873325e88eed12d80a7d"
+        },
+        {
+          "path": "pytorch_model.bin",
+          "size_bytes": 989820849,
+          "sha256": "d6638651a5526cc2ede56f2b5104d6851b0755816d220e5e046870430180c767"
+        },
+        {
+          "path": "special_tokens_map.json",
+          "size_bytes": 125,
+          "sha256": "b6d346be366a7d1d48332dbc9fdf3bf8960b5d879522b7799ddba59e76237ee3"
+        },
+        {
+          "path": "tokenizer.json",
+          "size_bytes": 711396,
+          "sha256": "d241a60d5e8f04cc1b2b3e9ef7a4921b27bf526d9f6050ab90f9267a1f9e5c66"
+        },
+        {
+          "path": "tokenizer_config.json",
+          "size_bytes": 506,
+          "sha256": "5c7f96096284c55e539eff95f4451c19efc34258ddb975a4400d052b77301e5e"
+        },
+        {
+          "path": "vocab.txt",
+          "size_bytes": 231508,
+          "sha256": "07eced375cec144d27c900241f3e339478dec958f92fddbc551f295c992038a3"
+        }
+      ]
+    }
+  }
+}

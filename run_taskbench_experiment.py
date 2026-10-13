@@ -25,10 +25,7 @@ from evaluation import set_quality
 from json_repair_evaluation import evaluate_json_repair
 
 
-FIXED = {
-    "gen_length": 128,
-    "block_length": 128,
-    "steps": 32,
+OMTP_FIXED = {
     "temperature": 0.0,
     "seed": 20261009,
     "stable_n": 2,
@@ -41,6 +38,25 @@ FIXED = {
     "profile_observer": False,
 }
 
+GENERATION_PROFILES = {
+    "fixed128": {
+        "gen_length": 128,
+        "block_length": 128,
+        "steps": 32,
+    },
+    "diagnostic256": {
+        "gen_length": 256,
+        "block_length": 256,
+        "steps": 64,
+    },
+}
+
+# Backward-compatible public constant used by existing tests and analysis code.
+FIXED = {
+    **GENERATION_PROFILES["fixed128"],
+    **OMTP_FIXED,
+}
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -49,6 +65,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-path", default="/data/labshare/Param/llada")
     parser.add_argument("--fastdllm-root", default="/data/home/yzx/Fast-dLLM")
     parser.add_argument("--output-dir", required=True)
+    parser.add_argument(
+        "--generation-profile",
+        choices=tuple(GENERATION_PROFILES),
+        default="fixed128",
+        help=(
+            "fixed128 is the frozen main experiment (128/128/32); "
+            "diagnostic256 is the isolated length ablation (256/256/64)."
+        ),
+    )
     parser.add_argument(
         "--cache-mode", choices=("none", "dual"), default="none",
         help="Fast-dLLM v1 no-cache or Dual Cache path; all OMTP settings remain fixed.",
@@ -66,7 +91,10 @@ def parse_args() -> argparse.Namespace:
 
 
 def _fixed_runtime_args(cli: argparse.Namespace) -> argparse.Namespace:
-    return argparse.Namespace(**vars(cli), **FIXED)
+    profile_name = getattr(cli, "generation_profile", "fixed128")
+    return argparse.Namespace(
+        **vars(cli), **OMTP_FIXED, **GENERATION_PROFILES[profile_name]
+    )
 
 
 def _augment(
@@ -134,11 +162,13 @@ def _augment(
 def _metadata(
     args: argparse.Namespace, output: Path, device: torch.device,
 ) -> None:
+    tool_name_audit_path = Path(args.manifest).resolve().parent / "tool_name_audit.json"
     value = {
         "created_at": datetime.now().astimezone().isoformat(),
         "command": sys.argv,
         "args": vars(args),
         "cache_mode": args.cache_mode,
+        "generation_profile": args.generation_profile,
         "fixed_generation_and_omtp_parameters": {
             key: getattr(args, key) for key in (
                 "gen_length", "block_length", "steps", "temperature", "seed",
@@ -164,6 +194,10 @@ def _metadata(
         },
         "manifest_sha256": sha256_file(args.manifest),
         "tool_catalog_sha256": sha256_file(args.tool_catalog),
+        "tool_name_audit": (
+            json.loads(tool_name_audit_path.read_text(encoding="utf-8"))
+            if tool_name_audit_path.is_file() else None
+        ),
         "dataset_validation": validate_taskbench_manifest(
             args.manifest, args.tool_catalog
         ),
@@ -227,6 +261,7 @@ def main() -> None:
         "position_records.jsonl", "failures.jsonl", "metadata.json",
         "taskbench_method_comparison.csv", "taskbench_group_summary.csv",
         "taskbench_position_summary.csv", "taskbench_generation_summary.csv",
+        "taskbench_tool_name_summary.csv", "taskbench_special_name_failures.jsonl",
     )
     for name in names:
         if (output / name).exists():

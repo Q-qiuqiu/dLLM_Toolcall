@@ -1,0 +1,18 @@
+{
+  "image": {
+    "path": "/data/home/yzx/dLLM_Toolcall/models/inputs/test_image_224.png",
+    "size": [
+      224,
+      224
+    ],
+    "sha256": "8be1c20bc2e1ffccbf4fbdee1d50665274c88ee7e0e6e3fb8d5f81f385f1cfcb",
+    "generation": "deterministic RGB gradient/shapes"
+  },
+  "audio": {
+    "path": "/data/home/yzx/dLLM_Toolcall/models/inputs/whisper_10s.wav",
+    "sample_rate": 16000,
+    "duration_s": 10.0,
+    "sha256": "cb02e92c5b43b94a5a245f10d0eb71a0e7c0194c6aad65893683ca4228da1133",
+    "source": "deterministic synthetic multi-tone audio"
+  }
+}

@@ -3,3 +3,12 @@ __pycache__/
 *.py[cod]
 data/
 results/
+models/*
+!models/src/
+!models/src/**
+models/src/__pycache__/
+models/src/**/*.py[cod]
+!models/README.md
+!models/model_manifest.json
+!models/inputs/
+!models/inputs/**

@@ -1,0 +1,9 @@
+# Install alongside the existing CUDA-enabled torch build; do not reinstall torch.
+transformers==4.49.0
+huggingface-hub==0.36.2
+fastapi==0.125.0
+uvicorn==0.38.0
+pillow==12.1.1
+soundfile==0.13.1
+numpy
+matplotlib

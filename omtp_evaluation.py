@@ -39,19 +39,28 @@ def evaluate_events(
     first_correct = None
     all_coverage = None
     exact_time = None
+    first_correct_forward = None
+    all_coverage_forward = None
+    exact_forward = None
     first_trigger = expanded[0]["predict_time_s"] if expanded else None
     per_tool: dict[str, float] = {}
+    per_tool_forward: dict[str, int] = {}
     for event in expanded:
         tool = str(event["predicted_tool"])
         when = float(event["predict_time_s"])
         predicted.add(tool)
         per_tool.setdefault(tool, when)
+        if event.get("forward_step") is not None:
+            per_tool_forward.setdefault(tool, int(event["forward_step"]))
         if tool in expected and first_correct is None:
             first_correct = when
+            first_correct_forward = event.get("forward_step")
         if expected and expected <= predicted and all_coverage is None:
             all_coverage = when
+            all_coverage_forward = event.get("forward_step")
         if expected and predicted == expected and exact_time is None:
             exact_time = when
+            exact_forward = event.get("forward_step")
     quality = set_quality(predicted, expected)
     return {
         "predicted_tools": sorted(predicted),
@@ -67,9 +76,13 @@ def evaluate_events(
         "correct_trigger_coverage": quality["recall"],
         "online_first_trigger_time_s": first_trigger,
         "oracle_first_correct_prediction_time_s": first_correct,
+        "oracle_first_correct_prediction_forward": first_correct_forward,
         "oracle_all_correct_coverage_time_s": all_coverage,
+        "oracle_all_correct_coverage_forward": all_coverage_forward,
         "oracle_exact_set_time_s": exact_time,
+        "oracle_exact_set_forward": exact_forward,
         "first_times_by_tool": dict(sorted(per_tool.items())),
+        "first_forwards_by_tool": dict(sorted(per_tool_forward.items())),
         "trigger_count": len(expanded),
     }
 

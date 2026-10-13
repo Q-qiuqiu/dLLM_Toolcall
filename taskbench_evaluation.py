@@ -74,6 +74,14 @@ def evaluate_taskbench_methods(
                 if current_time is not None and natural_time is not None
                 else None
             )
+        current_forward = current["oracle_all_correct_coverage_forward"]
+        natural_forward = natural["oracle_all_correct_coverage_forward"]
+        current["natural_coverage_forward"] = natural_forward
+        current["paired_coverage_lead_forwards"] = (
+            int(natural_forward) - int(current_forward)
+            if current_forward is not None and natural_forward is not None
+            else None
+        )
     return result
 
 

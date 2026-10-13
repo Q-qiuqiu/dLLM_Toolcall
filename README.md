@@ -330,3 +330,121 @@ OMTP、Natural 检测或模型输入。对已有结果可运行：
 该命令不会覆盖原始 `taskbench_samples.jsonl`，而是新增
 `taskbench_json_repair_samples.jsonl`、`taskbench_json_repair_summary.csv` 和
 `taskbench_json_repair_failures.jsonl`。
+
+## TaskBench HuggingFace / Multimedia 固定跨领域实验
+
+两个资源型领域使用与 DailyLife 完全相同的 OMTP + Fallback 核心及
+No Cache 128/128/32 推理配置。官方数据固定为 `microsoft/Taskbench`
+revision `d12764a8fa650f49f50507a02c3e707c71c67621`；预先生成的 Smoke 20
+与 Formal 200 清单互不重叠，选择种子为 `20261009`。HuggingFace 使用完整
+23 工具目录，Multimedia 使用完整 40 工具目录。Ground Truth、依赖边和参考
+执行步骤都不会进入 Prompt。
+
+校验已经下载的官方原始文件及其 SHA（首次获取时去掉 `--verify-only`）：
+
+```bash
+cd /data/home/yzx/dLLM_Toolcall
+python download_taskbench_domains.py --verify-only
+```
+
+先审计候选名的 tokenizer/Prefix 兼容性（该命令不运行模型）：
+
+```bash
+cd /data/home/yzx/dLLM_Toolcall
+/home/yzx/miniconda3/envs/llada/bin/python audit_taskbench_tool_names.py \
+  --tool-catalog data/taskbench/data_huggingface/tool_desc.json \
+  --tokenizer /data/labshare/Param/llada \
+  --output data/taskbench/data_huggingface/splits/tool_name_audit.json
+
+/home/yzx/miniconda3/envs/llada/bin/python audit_taskbench_tool_names.py \
+  --tool-catalog data/taskbench/data_multimedia/tool_desc.json \
+  --tokenizer /data/labshare/Param/llada \
+  --output data/taskbench/data_multimedia/splits/tool_name_audit.json
+```
+
+两个 20 条 No Cache Smoke Test：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 /home/yzx/miniconda3/envs/llada/bin/python \
+  run_taskbench_experiment.py \
+  --manifest data/taskbench/data_huggingface/splits/smoke20.jsonl \
+  --tool-catalog data/taskbench/data_huggingface/tool_desc.json \
+  --model-path /data/labshare/Param/llada \
+  --fastdllm-root /data/home/yzx/Fast-dLLM --cache-mode none \
+  --output-dir results/taskbench_huggingface_smoke20_nocache_fixed \
+  --parity-samples 1
+
+CUDA_VISIBLE_DEVICES=0 /home/yzx/miniconda3/envs/llada/bin/python \
+  run_taskbench_experiment.py \
+  --manifest data/taskbench/data_multimedia/splits/smoke20.jsonl \
+  --tool-catalog data/taskbench/data_multimedia/tool_desc.json \
+  --model-path /data/labshare/Param/llada \
+  --fastdllm-root /data/home/yzx/Fast-dLLM --cache-mode none \
+  --output-dir results/taskbench_multimedia_smoke20_nocache_fixed \
+  --parity-samples 1
+```
+
+确认 Smoke 的 NFE、Parity 和失败记录后，再分别运行互斥的正式 200 条：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 /home/yzx/miniconda3/envs/llada/bin/python \
+  run_taskbench_experiment.py \
+  --manifest data/taskbench/data_huggingface/splits/formal200.jsonl \
+  --tool-catalog data/taskbench/data_huggingface/tool_desc.json \
+  --model-path /data/labshare/Param/llada \
+  --fastdllm-root /data/home/yzx/Fast-dLLM --cache-mode none \
+  --output-dir results/taskbench_huggingface_formal200_nocache_fixed \
+  --parity-samples 1
+
+CUDA_VISIBLE_DEVICES=0 /home/yzx/miniconda3/envs/llada/bin/python \
+  run_taskbench_experiment.py \
+  --manifest data/taskbench/data_multimedia/splits/formal200.jsonl \
+  --tool-catalog data/taskbench/data_multimedia/tool_desc.json \
+  --model-path /data/labshare/Param/llada \
+  --fastdllm-root /data/home/yzx/Fast-dLLM --cache-mode none \
+  --output-dir results/taskbench_multimedia_formal200_nocache_fixed \
+  --parity-samples 1
+```
+
+正式结果完成后生成三领域描述性对照（不会重新运行推理）：
+
+```bash
+/home/yzx/miniconda3/envs/llada/bin/python compare_taskbench_domains.py \
+  --dailylife results/taskbench_dailylife_formal200_nocache_fixed \
+  --huggingface results/taskbench_huggingface_formal200_nocache_fixed \
+  --multimedia results/taskbench_multimedia_formal200_nocache_fixed \
+  --output-dir results/taskbench_cross_domain_fixed
+```
+
+每个领域目录会额外生成 `taskbench_tool_name_summary.csv` 和
+`taskbench_special_name_failures.jsonl`。后者只标注含空格、连字符或括号的
+漏检，不能单凭一条漏检断言是 Anchor 错误。Multimedia 目录里存在已知 Prefix
+关系 `Image Search` / `Image Search (by Image)`，保留原始名字且不为它改算法。
+
+### 256-token 独立诊断组
+
+主实验默认仍是 `fixed128`。若要判断输出预算对 JSON 和工具集合正确率的影响，
+可在同一 Smoke 20 上运行 `diagnostic256`；它只把 generation/block length 改为
+256、steps 改为 64，不改变 Prompt、样本、种子或 OMTP 参数，并必须使用独立
+结果目录：
+
+```bash
+for domain in huggingface multimedia; do
+  CUDA_VISIBLE_DEVICES=0 /home/yzx/miniconda3/envs/llada/bin/python \
+    run_taskbench_experiment.py \
+    --manifest data/taskbench/data_${domain}/splits/smoke20.jsonl \
+    --tool-catalog data/taskbench/data_${domain}/tool_desc.json \
+    --model-path /data/labshare/Param/llada \
+    --fastdllm-root /data/home/yzx/Fast-dLLM \
+    --cache-mode none --generation-profile diagnostic256 \
+    --output-dir results/taskbench_${domain}_smoke20_nocache_256diag \
+    --parity-samples 1
+done
+```
+
+## 独立真实工具模型冷启动实验
+
+模型权重、固定输入、版本与 SHA 清单位于 `models/`，服务和 benchmark 源码位于
+`models/src/`。这一实验与 OMTP 完全隔离；详细命令和时间字段定义见
+[`models/README.md`](models/README.md)。BLIP 只代表图像描述能力，不被标记为
+Multimedia OCR 工具的完整实现。
