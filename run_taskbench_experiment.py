@@ -1,61 +1,38 @@
-"""Run fixed Optimized OMTP + Fallback on a frozen TaskBench manifest."""
+"""Run TaskBench with OMTP + fallback; write only samples.jsonl."""
 
 from __future__ import annotations
 
 import argparse
+from dataclasses import asdict
 from datetime import datetime
-import json
 from pathlib import Path
 import platform
 import sys
-from typing import Any
 
 import torch
 
+from experiment_output import failure_sample, open_result_file, write_record
+from prompting import PROMPT_PROFILES
+from reliable_omtp_observer import add_reliability_arguments, reliability_options
+from response_prefill import RESPONSE_MODES
 from run_experiment import _git_head, _load_model
-from run_omtp_experiment import _run_sample, _runtime_failure_record
-from taskbench_data import (
-    TaskBenchSample, iter_taskbench_samples, sha256_file,
-    validate_taskbench_manifest,
-)
-from taskbench_evaluation import evaluate_taskbench_methods
-from taskbench_report import build_taskbench_report
-from tool_parser import extract_partial_names
-from evaluation import set_quality
-from json_repair_evaluation import evaluate_json_repair
+from run_omtp_experiment import _run_sample
+from taskbench_data import iter_taskbench_samples, sha256_file, validate_taskbench_manifest
+from tool_format import OUTPUT_SCHEMAS
 
 
 OMTP_FIXED = {
-    "temperature": 0.0,
-    "seed": 20261009,
-    "stable_n": 2,
-    "region_radius": 4,
-    "region_top_k": 2,
-    "min_seen": 2,
-    "min_support": 0.5,
-    "min_top1_score": None,
-    "min_margin": None,
+    "temperature": 0.0, "seed": 20261009, "stable_n": 2,
+    "region_radius": 4, "region_top_k": 2, "min_seen": 2,
+    "min_support": 0.5, "min_top1_score": None, "min_margin": None,
     "profile_observer": False,
 }
-
 GENERATION_PROFILES = {
-    "fixed128": {
-        "gen_length": 128,
-        "block_length": 128,
-        "steps": 32,
-    },
-    "diagnostic256": {
-        "gen_length": 256,
-        "block_length": 256,
-        "steps": 64,
-    },
+    "fixed128": {"gen_length": 128, "block_length": 128, "steps": 32},
+    "diagnostic256": {"gen_length": 256, "block_length": 256, "steps": 64},
 }
-
-# Backward-compatible public constant used by existing tests and analysis code.
-FIXED = {
-    **GENERATION_PROFILES["fixed128"],
-    **OMTP_FIXED,
-}
+# Public compatibility constant used by tests and historical analysis tools.
+FIXED = {**GENERATION_PROFILES["fixed128"], **OMTP_FIXED}
 
 
 def parse_args() -> argparse.Namespace:
@@ -65,182 +42,72 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-path", default="/data/labshare/Param/llada")
     parser.add_argument("--fastdllm-root", default="/data/home/yzx/Fast-dLLM")
     parser.add_argument("--output-dir", required=True)
-    parser.add_argument(
-        "--generation-profile",
-        choices=tuple(GENERATION_PROFILES),
-        default="fixed128",
-        help=(
-            "fixed128 is the frozen main experiment (128/128/32); "
-            "diagnostic256 is the isolated length ablation (256/256/64)."
-        ),
-    )
-    parser.add_argument(
-        "--cache-mode", choices=("none", "dual"), default="none",
-        help="Fast-dLLM v1 no-cache or Dual Cache path; all OMTP settings remain fixed.",
-    )
+    parser.add_argument("--generation-profile", choices=tuple(GENERATION_PROFILES), default="fixed128")
+    parser.add_argument("--prompt-profile", choices=PROMPT_PROFILES, default="compact_json_v3")
+    parser.add_argument("--cache-mode", choices=("none", "dual"), default="none")
+    parser.add_argument("--response-mode", choices=RESPONSE_MODES, default="native")
+    parser.add_argument("--output-schema", choices=OUTPUT_SCHEMAS, default="standard")
     parser.add_argument("--device", default="cuda")
-    parser.add_argument(
-        "--dtype", choices=("bfloat16", "float16", "float32"),
-        default="bfloat16",
-    )
-    parser.add_argument(
-        "--parity-samples", type=int, default=1,
-        help="Observer-off/on parity checks for the first N requests.",
-    )
+    parser.add_argument("--dtype", choices=("bfloat16", "float16", "float32"), default="bfloat16")
+    parser.add_argument("--parity-samples", type=int, default=1)
+    parser.add_argument("--debug-output", action="store_true", help="Include full trajectories in the same JSONL; still no extra files.")
+    add_reliability_arguments(parser)
     return parser.parse_args()
 
 
 def _fixed_runtime_args(cli: argparse.Namespace) -> argparse.Namespace:
-    profile_name = getattr(cli, "generation_profile", "fixed128")
-    return argparse.Namespace(
-        **vars(cli), **OMTP_FIXED, **GENERATION_PROFILES[profile_name]
-    )
+    profile = getattr(cli, "generation_profile", "fixed128")
+    args = argparse.Namespace(**vars(cli), **OMTP_FIXED, **GENERATION_PROFILES[profile])
+    args.min_top1_score = getattr(cli, "omtp_min_top1_score", None)
+    args.min_margin = getattr(cli, "omtp_min_margin", None)
+    return args
 
 
-def _augment(
-    record: dict[str, Any], sample: TaskBenchSample, observer: Any | None,
-    tokenizer: Any | None, *, gen_length: int = 128,
-    expected_nfe: int = 32,
-) -> dict[str, Any]:
-    latent_events = list(observer.latent_events) if observer is not None else []
-    methods = evaluate_taskbench_methods(
-        latent_events=latent_events,
-        fallback_events=record["omtp_fallback_events"],
-        natural_events=record["natural_baseline"]["events"],
-        ground_truth_occurrences=[
-            call["name"] for call in sample.ground_truth_calls
-        ],
-        final_occurrences=record["final_tool_occurrences"],
-    )
-    output_tokens = None
-    if tokenizer is not None and record.get("raw_output"):
-        output_tokens = len(tokenizer(
-            record["raw_output"], add_special_tokens=False
-        ).input_ids)
-    raw_tools = extract_partial_names(
-        record.get("raw_output", ""), sample.candidate_names
-    )
-    raw_quality = set_quality(raw_tools, sample.ground_truth_tool_types)
-    record.update({
-        "benchmark": f"taskbench_{sample.domain}",
-        "cache_mode": record.get("cache_mode"),
-        "source_id": sample.source_id,
-        "source_seed": sample.source_seed,
-        "graph_type": sample.graph_type,
-        "ground_truth_calls": sample.ground_truth_calls,
-        "dependency_edges": sample.dependencies,
-        "reference_steps": sample.reference_steps,
-        "ground_truth_call_count": sample.tool_call_count,
-        "ground_truth_tool_type_count": sample.tool_type_count,
-        "dependency_edge_count": len(sample.dependencies),
-        "latent_region_events": latent_events,
-        "taskbench_methods": methods,
-        "decoded_output_token_count": output_tokens,
-        # This is deliberately labelled a heuristic: special-token removal can
-        # make decoded/re-tokenized length differ slightly from the generation
-        # canvas.
-        "likely_length_truncated": bool(
-            not record.get("tool_call_format_valid")
-            and output_tokens is not None and output_tokens >= gen_length - 2
-        ),
-        "generation_length": gen_length,
-        "expected_forward_count": expected_nfe,
-        "final_raw_tool_types": sorted(set(raw_tools)),
-        "final_raw_tool_precision": raw_quality["precision"],
-        "final_raw_tool_recall": raw_quality["recall"],
-        "final_raw_tool_f1": raw_quality["f1"],
-        "final_raw_tool_set_exact_match": raw_quality["exact"],
-    })
-    record.update(evaluate_json_repair(
-        record.get("evaluated_output_before_eos", record.get("raw_output", "")),
-        sample.candidate_names,
-        sample,
-    ))
-    return record
-
-
-def _metadata(
-    args: argparse.Namespace, output: Path, device: torch.device,
-) -> None:
-    tool_name_audit_path = Path(args.manifest).resolve().parent / "tool_name_audit.json"
-    value = {
+def _metadata(args: argparse.Namespace, device: torch.device) -> dict:
+    source = Path(__file__).resolve().parent
+    return {
+        "record_type": "metadata", "schema_version": "tool_first_v1",
         "created_at": datetime.now().astimezone().isoformat(),
-        "command": sys.argv,
-        "args": vars(args),
-        "cache_mode": args.cache_mode,
-        "generation_profile": args.generation_profile,
-        "fixed_generation_and_omtp_parameters": {
-            key: getattr(args, key) for key in (
-                "gen_length", "block_length", "steps", "temperature", "seed",
-                "stable_n", "region_radius", "region_top_k", "min_seen",
-                "min_support", "min_top1_score", "min_margin",
-                "profile_observer",
-            )
-        },
-        "python": sys.version,
-        "platform": platform.platform(),
-        "torch": torch.__version__,
-        "cuda": torch.version.cuda,
+        "command": sys.argv, "args": vars(args),
+        "python": sys.version, "platform": platform.platform(),
+        "torch": torch.__version__, "cuda": torch.version.cuda,
         "device": str(device),
         "gpu": torch.cuda.get_device_name(device) if device.type == "cuda" else None,
         "fastdllm_commit": _git_head(args.fastdllm_root),
-        "omtp_core_sha256": {
-            name: sha256_file(Path(__file__).resolve().parent / name)
-            for name in (
-                "omtp_observer.py", "optimized_omtp_observer.py",
-                "omtp_evaluation.py", "run_omtp_experiment.py",
-                "prompting.py", "fastdllm_generate.py",
-            )
-        },
         "manifest_sha256": sha256_file(args.manifest),
         "tool_catalog_sha256": sha256_file(args.tool_catalog),
-        "tool_name_audit": (
-            json.loads(tool_name_audit_path.read_text(encoding="utf-8"))
-            if tool_name_audit_path.is_file() else None
-        ),
-        "dataset_validation": validate_taskbench_manifest(
-            args.manifest, args.tool_catalog
-        ),
+        "dataset_validation": validate_taskbench_manifest(args.manifest, args.tool_catalog),
+        "code_sha256": {
+            name: sha256_file(source / name) for name in (
+                "run_taskbench_experiment.py", "run_omtp_experiment.py",
+                "omtp_observer.py", "optimized_omtp_observer.py", "observer.py",
+                "reliable_omtp_observer.py", "prefix_detection.py",
+                "experiment_output.py", "prompting.py", "taskbench_data.py",
+                "fastdllm_generate.py", "model_adapter.py", "response_prefill.py",
+                "tool_format.py", "tool_parser.py",
+            )
+        },
         "online_method": {
-            "name": "optimized_omtp_with_prefix_natural_fallback",
-            "core_implementation_reused_without_changes": True,
-            "candidate_scope": (
-                f"complete {Path(args.tool_catalog).resolve().parent.name} "
-                "tool catalog"
-            ),
-            "ground_truth_used_online": False,
-            "extra_model_forwards_per_request": 0,
+            "name": "optimized_omtp_prefix_natural_first_per_tool",
+            "reliability_options": asdict(reliability_options(args)),
+            "min_top1_score": args.min_top1_score, "min_margin": args.min_margin,
+            "commit_policy": "first causal event per tool identity across all tracks and sources",
+            "prefix_policy": "whole committed text prefix unique among full catalog; no committed suffix conflicts",
+            "ground_truth_used_online": False, "extra_model_forwards": 0,
         },
-        "post_generation_json_repair": {
-            "library": "json-repair",
-            "offline_only": True,
-            "applied_only_after_generation": True,
-            "feeds_online_prediction": False,
-            "strict_tool_call_validation_after_repair": True,
+        "timing_semantics": {
+            "zero": "before generation canvas construction; includes model prompt processing",
+            "excludes": ["prompt rendering/tokenization", "model loading", "post-generation evaluation", "file serialization"],
+            "events": "after causal detection/scoring; natural scan precedes region scoring",
+            "natural_baseline": "same observer-on request; not a separately measured observer-off request",
+            "cuda": "generation callback path synchronizes model/transfer work",
         },
-        "prompt_excludes": [
-            "ground_truth_calls", "dependency_edges", "reference_steps"
-        ],
-        "timing_semantics": (
-            "Request time zero is before generation canvas construction; model "
-            "forward work is CUDA-synchronized by the existing callback path, "
-            "and online event timestamps include observer detection/scoring."
-        ),
-        "parity_method": (
-            "Selected requests use an observer-off warmup, measured observer-off "
-            "run, then measured observer-on run with the identical seed."
-        ),
+        "offline_evaluation": {
+            "json_repair_and_ast": "not run automatically; raw text and reference calls retained",
+            "prefix_model_invalid_name": "separate attribution, not a detector error; physical false-start cost remains",
+        },
+        "prompt_excludes": ["ground_truth_calls", "dependency_edges", "reference_steps"],
     }
-    (output / "metadata.json").write_text(
-        json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
-
-
-def _write_events(handle: Any, sample_id: str, events: list[dict[str, Any]]) -> None:
-    for event in events:
-        handle.write(json.dumps(
-            {"sample_id": sample_id, **event}, ensure_ascii=False
-        ) + "\n")
 
 
 def main() -> None:
@@ -253,102 +120,19 @@ def main() -> None:
     samples = list(iter_taskbench_samples(args.manifest, args.tool_catalog))
     if not samples:
         raise ValueError("empty TaskBench manifest")
-    output = Path(args.output_dir)
-    names = (
-        "taskbench_samples.jsonl", "samples.jsonl", "steps.jsonl",
-        "omtp_events.jsonl", "latent_events.jsonl", "omtp_fallback_events.jsonl",
-        "natural_events.jsonl", "omtp_trajectory.jsonl",
-        "position_records.jsonl", "failures.jsonl", "metadata.json",
-        "taskbench_method_comparison.csv", "taskbench_group_summary.csv",
-        "taskbench_position_summary.csv", "taskbench_generation_summary.csv",
-        "taskbench_tool_name_summary.csv", "taskbench_special_name_failures.jsonl",
-    )
-    for name in names:
-        if (output / name).exists():
-            raise FileExistsError(f"refusing to overwrite {output / name}")
-    output.mkdir(parents=True, exist_ok=True)
     device = torch.device(args.device)
-    model, tokenizer = _load_model(args, device)
-    _metadata(args, output, device)
-    paths = {
-        name: (output / name).open("w", encoding="utf-8")
-        for name in (
-            "taskbench_samples.jsonl", "samples.jsonl", "steps.jsonl",
-            "omtp_events.jsonl", "latent_events.jsonl", "omtp_fallback_events.jsonl",
-            "natural_events.jsonl", "omtp_trajectory.jsonl",
-            "position_records.jsonl", "failures.jsonl",
-        )
-    }
-    try:
+    with open_result_file(args.output_dir) as handle:
+        model, tokenizer = _load_model(args, device)
+        write_record(handle, _metadata(args, device))
         for index, sample in enumerate(samples):
             print(f"[{index + 1}/{len(samples)}] {sample.sample_id}", flush=True)
-            observer = None
             try:
-                record, observer = _run_sample(
-                    args, sample, index, model, tokenizer, device
-                )
-                record = _augment(
-                    record, sample, observer, tokenizer,
-                    gen_length=args.gen_length, expected_nfe=args.steps,
-                )
-                record["cache_mode"] = args.cache_mode
+                record, _ = _run_sample(args, sample, index, model, tokenizer, device)
             except Exception as error:
-                print(
-                    f"  FAILED: {type(error).__name__}: {error}",
-                    file=sys.stderr, flush=True,
-                )
-                record = _augment(
-                    _runtime_failure_record(sample, error), sample, None, None,
-                    gen_length=args.gen_length, expected_nfe=args.steps,
-                )
-                record["cache_mode"] = args.cache_mode
-                record["runtime_error"] = f"{type(error).__name__}: {error}"
-
-            serialized = json.dumps(record, ensure_ascii=False) + "\n"
-            paths["taskbench_samples.jsonl"].write(serialized)
-            paths["samples.jsonl"].write(serialized)
-            _write_events(paths["omtp_events.jsonl"], sample.sample_id,
-                          record["omtp_events"])
-            _write_events(paths["latent_events.jsonl"], sample.sample_id,
-                          record["latent_region_events"])
-            _write_events(paths["omtp_fallback_events.jsonl"], sample.sample_id,
-                          record["omtp_fallback_events"])
-            _write_events(paths["natural_events.jsonl"], sample.sample_id,
-                          record["natural_baseline"]["events"])
-            _write_events(paths["steps.jsonl"], sample.sample_id, record["steps"])
-            _write_events(paths["omtp_trajectory.jsonl"], sample.sample_id,
-                          record["omtp_trajectory"])
-            for method, value in record["taskbench_methods"].items():
-                for row in value["vs_ground_truth"]["position_records"]:
-                    paths["position_records.jsonl"].write(json.dumps({
-                        "sample_id": sample.sample_id,
-                        "graph_type": sample.graph_type,
-                        "method": method,
-                        **row,
-                    }, ensure_ascii=False) + "\n")
-
-            failures = []
-            if record.get("runtime_error"): failures.append("runtime_error")
-            if not record["final_json_valid"]: failures.append("invalid_json")
-            if not record["tool_set_exact_match"]: failures.append("final_tool_set_mismatch")
-            if record["likely_length_truncated"]: failures.append("likely_length_truncated")
-            if record["observer_output_identical"] is False: failures.append("observer_changed_output")
-            if record["observer_nfe_identical"] is False: failures.append("observer_changed_nfe")
-            if failures:
-                paths["failures.jsonl"].write(json.dumps({
-                    "sample_id": sample.sample_id,
-                    "graph_type": sample.graph_type,
-                    "failure_types": failures,
-                    "error": record.get("runtime_error"),
-                    "raw_output": record["raw_output"],
-                }, ensure_ascii=False) + "\n")
-            for handle in paths.values():
-                handle.flush()
-    finally:
-        for handle in paths.values():
-            handle.close()
-    build_taskbench_report(output)
-    print(f"Results written to {output.resolve()}")
+                print(f"  FAILED: {type(error).__name__}: {error}", file=sys.stderr, flush=True)
+                record = failure_sample(sample, args.seed + index, error)
+            write_record(handle, record)
+    print(f"Results written to {Path(args.output_dir).resolve() / 'samples.jsonl'}")
 
 
 if __name__ == "__main__":

@@ -7,6 +7,8 @@ import json
 import re
 from typing import Any, Iterable
 
+from tool_format import OUTPUT_SCHEMAS, convert_flat_calls
+
 
 @dataclass(frozen=True)
 class ParseResult:
@@ -27,8 +29,17 @@ class ParseResult:
         return [str(call["name"]) for call in self.calls]
 
 
-def parse_tool_calls(text: str, candidate_names: Iterable[str]) -> ParseResult:
+def parse_tool_calls(
+    text: str,
+    candidate_names: Iterable[str],
+    *,
+    output_schema: str = "standard",
+    functions: Iterable[dict[str, Any]] = (),
+) -> ParseResult:
     """Parse the experiment's exact output format; markdown is intentionally invalid."""
+
+    if output_schema not in OUTPUT_SCHEMAS:
+        raise ValueError(f"unsupported output schema: {output_schema!r}")
 
     try:
         value = json.loads(text.strip())
@@ -38,6 +49,16 @@ def parse_tool_calls(text: str, candidate_names: Iterable[str]) -> ParseResult:
         )
     if not isinstance(value, list):
         return ParseResult(True, False, False, [], "top_level_not_array")
+    if output_schema == "flat_name_v1":
+        calls, format_error, candidate_names_valid = convert_flat_calls(
+            value,
+            candidate_names=candidate_names,
+            functions=functions,
+        )
+        if format_error is not None:
+            return ParseResult(True, False, False, calls, format_error)
+        error = None if candidate_names_valid else "unknown_candidate_name"
+        return ParseResult(True, True, candidate_names_valid, calls, error)
     candidates = set(candidate_names)
     calls: list[dict[str, Any]] = []
     candidate_names_valid = True

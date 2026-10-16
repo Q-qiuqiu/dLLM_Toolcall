@@ -1,4 +1,4 @@
-"""Audit candidate tool names against the frozen LLaDA tokenizer and OMTP."""
+"""Audit candidate tool names against a selected backbone tokenizer and OMTP."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ import re
 
 from transformers import AutoTokenizer
 
+from model_adapter import resolve_model_path
 from omtp_observer import OMTPObserver
 from taskbench_data import load_tool_catalog
 
@@ -21,8 +22,9 @@ def main() -> None:
     args = parser.parse_args()
     functions = load_tool_catalog(args.tool_catalog)
     names = [function["name"] for function in functions]
+    resolved_tokenizer = resolve_model_path(args.tokenizer)
     tokenizer = AutoTokenizer.from_pretrained(
-        args.tokenizer, trust_remote_code=True, local_files_only=True
+        resolved_tokenizer, trust_remote_code=True, local_files_only=True
     )
     observer = OMTPObserver(tokenizer=tokenizer, candidate_names=names)
     rows = []
@@ -55,7 +57,8 @@ def main() -> None:
     ]
     value = {
         "tool_catalog": str(Path(args.tool_catalog).resolve()),
-        "tokenizer": str(Path(args.tokenizer).resolve()),
+        "tokenizer_requested": str(Path(args.tokenizer).resolve()),
+        "tokenizer": str(resolved_tokenizer),
         "tool_count": len(names),
         "observer_construction_ok": True,
         "empty_tokenization_count": sum(not row["token_ids"] for row in rows),

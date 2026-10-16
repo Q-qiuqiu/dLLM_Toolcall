@@ -70,6 +70,42 @@ def test_observer_off_and_on_produce_identical_tokens():
     assert observations[0].elapsed_s <= observations[0].commit_elapsed_s
 
 
+def test_generation_prefix_is_committed_inside_canvas_and_preserves_parity():
+    model = FakeModel()
+    prompt = torch.tensor([[1, 2]])
+    prefix = [20, 21]
+    baseline, baseline_nfe = generate(
+        model, prompt, steps=2, gen_length=4, block_length=4,
+        mask_id=31, generation_prefix_ids=prefix,
+    )
+    observations = []
+    observed, observed_nfe = generate(
+        model, prompt, steps=2, gen_length=4, block_length=4,
+        mask_id=31, generation_prefix_ids=prefix,
+        observation_callback=observations.append,
+    )
+    assert torch.equal(baseline, observed)
+    assert baseline_nfe == observed_nfe == 2
+    assert observed[0, 2:4].tolist() == prefix
+    assert observations[0].x[0, 2:4].tolist() == prefix
+    assert int((observations[0].x[:, 2:] == 31).sum()) == 2
+
+
+def test_generation_prefix_rejects_mask_and_full_canvas():
+    model = FakeModel()
+    prompt = torch.tensor([[1]])
+    for prefix in ([31], [10, 11, 12, 13]):
+        try:
+            generate(
+                model, prompt, steps=2, gen_length=4, block_length=4,
+                mask_id=31, generation_prefix_ids=prefix,
+            )
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("invalid generation prefix was accepted")
+
+
 def test_block_metadata_and_forward_count():
     observations = []
     output, nfe = generate(

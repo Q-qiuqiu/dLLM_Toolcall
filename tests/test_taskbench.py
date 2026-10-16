@@ -1,11 +1,16 @@
 import argparse
 import json
 
+from convert_flat_tool_calls import convert_text
 from json_repair_evaluation import evaluate_json_repair
-from prompting import build_messages
+from prompting import build_messages, render_prompt
 from run_taskbench_experiment import FIXED, _fixed_runtime_args
 from taskbench_data import (
     iter_taskbench_samples, load_tool_catalog, validate_taskbench_manifest,
+)
+from taskbench_dependency_evaluation import (
+    audit_ground_truth_references, evaluate_semantic_dependencies,
+    resolve_node_references,
 )
 from taskbench_evaluation import FALLBACK, LATENT, NATURAL, evaluate_taskbench_methods
 from taskbench_report import build_taskbench_report
@@ -67,6 +72,194 @@ def test_resource_tool_catalog_preserves_special_names_and_positional_inputs(tmp
     assert functions[0]["name"] == "Image Search (by Image)"
     assert functions[0]["parameters"]["required"] == ["input_1"]
     assert functions[0]["parameters"]["properties"]["input_1"]["type"] == "string"
+
+
+def test_strict_prompt_uses_object_schema_and_concise_json_contract(tmp_path):
+    catalog = tmp_path / "tool_desc.json"
+    catalog.write_text(json.dumps({"nodes": [{
+        "id": "Image Search (by Image)", "desc": "Find images",
+        "input-type": ["image"], "output-type": ["image"],
+    }]}), encoding="utf-8")
+    functions = load_tool_catalog(catalog)
+
+    class Sample:
+        messages = [{"role": "user", "content": "Find a similar image"}]
+        ground_truth = "SECRET_GROUND_TRUTH"
+
+    sample = Sample()
+    sample.functions = functions
+    messages = build_messages(sample, "strict_json_v2")
+    rendered = "\n".join(message["content"] for message in messages)
+    assert '"type":"object"' in rendered
+    assert '"type":"dict"' not in rendered
+    assert "at most 32 characters" in rendered
+    assert "spaces, hyphens, and parentheses" in rendered
+    assert "Image Search (by Image)" in rendered
+    assert "SECRET_GROUND_TRUTH" not in rendered
+
+
+def test_compact_prompt_uses_object_schema_without_negative_constraints(tmp_path):
+    catalog = tmp_path / "tool_desc.json"
+    catalog.write_text(json.dumps({"nodes": [{
+        "id": "Image Search (by Image)", "desc": "Find images",
+        "input-type": ["image"], "output-type": ["image"],
+    }]}), encoding="utf-8")
+    functions = load_tool_catalog(catalog)
+
+    class Sample:
+        messages = [{"role": "user", "content": "Find a similar image"}]
+        ground_truth = "SECRET_GROUND_TRUTH"
+
+    sample = Sample()
+    sample.functions = functions
+    messages = build_messages(sample, "compact_json_v3")
+    rendered = "\n".join(message["content"] for message in messages)
+    assert '"type":"object"' in rendered
+    assert '"type":"dict"' not in rendered
+    assert "Image Search (by Image)" in rendered
+    assert "SECRET_GROUND_TRUTH" not in rendered
+    assert "at most 32 characters" not in rendered
+    assert "Do not" not in rendered
+    assert "Never" not in rendered
+    assert '"enum"' not in rendered
+
+
+def test_flat_name_prompt_removes_arguments_wrapper_and_aliases_name_parameter(tmp_path):
+    catalog = tmp_path / "tool_desc.json"
+    catalog.write_text(json.dumps({"nodes": [{
+        "id": "book_hotel", "desc": "Book a hotel", "parameters": [
+            {"name": "date", "type": "date", "desc": "date"},
+            {"name": "name", "type": "string", "desc": "hotel name"},
+        ],
+    }]}), encoding="utf-8")
+
+    class Sample:
+        messages = [{"role": "user", "content": "Book Hilton tomorrow"}]
+        ground_truth = "SECRET_GROUND_TRUTH"
+        functions = load_tool_catalog(catalog)
+
+    messages = build_messages(
+        Sample(), "compact_json_v3", "flat_name_v1"
+    )
+    rendered = "\n".join(message["content"] for message in messages)
+    assert 'first field is "name"' in rendered
+    assert "arg_name:string" in rendered
+    assert "date:string" in rendered
+    assert '"arguments"' not in rendered
+    assert '"parameters"' not in rendered
+    assert "SECRET_GROUND_TRUTH" not in rendered
+
+    flat_file = tmp_path / "flat.json"
+    flat_file.write_text(
+        '[{"name":"book_hotel","date":"tomorrow","arg_name":"Hilton"}]',
+        encoding="utf-8",
+    )
+    assert convert_text(flat_file.read_text(), catalog) == [{
+        "name": "book_hotel",
+        "arguments": {"date": "tomorrow", "name": "Hilton"},
+    }]
+
+
+def test_dependency_prompt_teaches_prior_node_references_without_gt_leak(tmp_path):
+    catalog, manifest = _files(tmp_path)
+    sample = next(iter_taskbench_samples(manifest, catalog))
+    messages = build_messages(
+        sample, "compact_json_dep_v4", "flat_name_v1"
+    )
+    rendered = "\n".join(message["content"] for message in messages)
+    assert 'items are numbered from 0' in rendered.lower()
+    assert '"<node-N>"' in rendered
+    assert '"input_1":"<node-0>"' in rendered
+    assert '"arguments"' not in rendered
+    assert 'GT_SECRET_2042' not in rendered
+    assert 'REFERENCE_SECRET_9988' not in rendered
+    assert '"source"' not in rendered and '"target"' not in rendered
+
+
+def test_dependency_prompt_requires_flat_output_schema(tmp_path):
+    catalog, manifest = _files(tmp_path)
+    sample = next(iter_taskbench_samples(manifest, catalog))
+    try:
+        build_messages(sample, "compact_json_dep_v4", "standard")
+    except ValueError as error:
+        assert "requires output_schema=flat_name_v1" in str(error)
+    else:
+        raise AssertionError("dependency prompt must reject the standard schema")
+
+
+def test_semantic_dependency_evaluation_resolves_generated_array_indices():
+    calls = [
+        {"name": "tool_a", "arguments": {"value": "input"}},
+        {"name": "tool_b", "arguments": {"value": "<node-0>"}},
+        {"name": "tool_c", "arguments": {"nested": ["<node-1>"]}},
+    ]
+    ground_truth = [
+        {"name": "tool_a", "arguments": {}},
+        {"name": "tool_b", "arguments": {}},
+        {"name": "tool_c", "arguments": {}},
+    ]
+    result = evaluate_semantic_dependencies(
+        calls,
+        [
+            {"source": "tool_a", "target": "tool_b"},
+            {"source": "tool_b", "target": "tool_c"},
+        ],
+        ground_truth,
+        output_valid=True,
+    )
+    assert result["valid_reference_count"] == 2
+    assert result["dependency_edge_precision"] == 1.0
+    assert result["dependency_edge_recall"] == 1.0
+    assert result["dependency_edge_exact_match"]
+    assert result["semantic_plan_exact_match"]
+    assert result["ordered_semantic_plan_exact_match"]
+    assert result["valid_ordered_semantic_plan_exact_match"]
+
+
+def test_semantic_dependency_evaluation_keeps_invalid_and_malformed_refs():
+    result = resolve_node_references([
+        {"name": "tool_a", "arguments": {"x": "node-0"}},
+        {"name": "tool_b", "arguments": {"x": "<node-1>"}},
+        {"name": "tool_c", "arguments": {"x": "<node-9>"}},
+    ])
+    assert result["reference_count"] == 2
+    assert result["valid_reference_count"] == 0
+    assert result["invalid_reference_count"] == 2
+    assert result["malformed_reference_count"] == 1
+    assert {row["reason"] for row in result["invalid_references"]} == {
+        "self_or_forward_reference", "source_index_out_of_range",
+    }
+
+
+def test_prompt_folds_system_instruction_for_illada_template(tmp_path):
+    catalog = tmp_path / "tool_desc.json"
+    catalog.write_text(json.dumps({"nodes": [{
+        "id": "Translation", "desc": "Translate text",
+        "input-type": ["text"], "output-type": ["text"],
+    }]}), encoding="utf-8")
+
+    class Sample:
+        messages = [{"role": "user", "content": "Translate hello"}]
+        ground_truth = "SECRET_GROUND_TRUTH"
+        functions = load_tool_catalog(catalog)
+
+    class UserOnlyTokenizer:
+        def apply_chat_template(
+            self, messages, *, add_generation_prompt, tokenize
+        ):
+            assert add_generation_prompt and not tokenize
+            if messages[0]["role"] == "system":
+                raise ValueError("System role not supported")
+            assert [message["role"] for message in messages] == ["user"]
+            return "<user>" + messages[0]["content"] + "<assistant>"
+
+    rendered = render_prompt(
+        UserOnlyTokenizer(), Sample(), "compact_json_v3"
+    )
+    assert rendered.startswith("<user>You are a function-calling assistant.")
+    assert "Translate hello" in rendered
+    assert "Translation" in rendered
+    assert "SECRET_GROUND_TRUTH" not in rendered
 
 
 def test_three_methods_are_separate_and_duplicate_calls_are_not_collapsed():
@@ -131,6 +324,27 @@ def test_json_repair_recovers_missing_separator(tmp_path):
     assert result["repaired_tool_set_exact_match"]
 
 
+def test_json_repair_converts_flat_name_schema(tmp_path):
+    catalog, manifest = _files(tmp_path)
+    sample = next(iter_taskbench_samples(manifest, catalog))
+    broken = (
+        '[{"name":"tool_a","when":"tomorrow"} '
+        '{"name":"tool_b"}]'
+    )
+    result = evaluate_json_repair(
+        broken,
+        sample.candidate_names,
+        sample,
+        output_schema="flat_name_v1",
+    )
+    assert result["repaired_json_valid"]
+    assert result["repaired_tool_call_format_valid"]
+    assert result["repaired_tool_calls"] == [
+        {"name": "tool_a", "arguments": {"when": "tomorrow"}},
+        {"name": "tool_b", "arguments": {}},
+    ]
+
+
 def test_json_repair_does_not_hide_wrong_tool_schema(tmp_path):
     catalog, manifest = _files(tmp_path)
     sample = next(iter_taskbench_samples(manifest, catalog))
@@ -155,6 +369,14 @@ def test_taskbench_report_writes_tables_and_figures(tmp_path):
         ground_truth_occurrences=["tool_a", "tool_b"],
         final_occurrences=["tool_a", "tool_b"],
     )
+    calls = [
+        {"name": "tool_a", "arguments": {}},
+        {"name": "tool_b", "arguments": {"input": "<node-0>"}},
+    ]
+    dependencies = [{"source": "tool_a", "target": "tool_b"}]
+    semantic = evaluate_semantic_dependencies(
+        calls, dependencies, calls, output_valid=True
+    )
     sample = {
         "sample_id": "x", "graph_type": "chain",
         "ground_truth_call_count": 2, "ground_truth_tool_type_count": 2,
@@ -168,6 +390,11 @@ def test_taskbench_report_writes_tables_and_figures(tmp_path):
         "observer_mean_processing_time_s": .0125,
         "observer_off_generation_time_s": 3.8,
         "observer_wall_overhead_ratio": .105, "prompt_token_count": 2800,
+        "semantic_dependency_raw": semantic,
+        "semantic_dependency_repaired": semantic,
+        "ground_truth_dependency_reference_audit": (
+            audit_ground_truth_references(calls)
+        ),
     }
     (tmp_path / "taskbench_samples.jsonl").write_text(
         json.dumps(sample) + "\n", encoding="utf-8"
@@ -179,5 +406,7 @@ def test_taskbench_report_writes_tables_and_figures(tmp_path):
         "figures/method_accuracy.png", "figures/paired_coverage_lead.png",
         "figures/position_1_4_timing.png", "figures/chain_dag_f1.png",
         "figures/observer_and_generation_quality.png",
+        "taskbench_dependency_summary.csv",
+        "taskbench_dependency_edges.jsonl",
     ):
         assert (tmp_path / name).exists()

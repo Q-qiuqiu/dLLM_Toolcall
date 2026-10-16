@@ -22,6 +22,7 @@ class OptimizedOMTPObserver(OMTPObserver):
         stable_n: int = 2,
         config: OMTPConfig | None = None,
         profile_enabled: bool = False,
+        record_history: bool = True,
     ) -> None:
         super().__init__(
             tokenizer=tokenizer,
@@ -29,6 +30,7 @@ class OptimizedOMTPObserver(OMTPObserver):
             stable_n=stable_n,
             config=config,
             profile_enabled=profile_enabled,
+            record_history=record_history,
         )
         self._cached_top_ids: torch.Tensor | None = None
         self._cached_row_max: torch.Tensor | None = None

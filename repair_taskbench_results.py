@@ -111,6 +111,7 @@ def main() -> None:
             row.update(evaluate_json_repair(
                 row.get("evaluated_output_before_eos", row.get("raw_output", "")),
                 row["candidate_tools"], sample,
+                output_schema=row.get("output_schema", "standard"),
             ))
             rows.append(row)
 

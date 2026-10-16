@@ -197,12 +197,30 @@ def _generation_rows(samples: list[dict[str, Any]]) -> list[dict[str, Any]]:
         row: dict[str, Any] = {
             "group": group, "sample_count": len(members),
             "final_json_valid_rate": mean(float(s["final_json_valid"]) for s in members),
+            "final_tool_call_format_valid_rate": mean(
+                float(s.get("tool_call_format_valid", False)) for s in members
+            ),
+            "final_candidate_names_valid_rate": mean(
+                float(s.get("candidate_names_valid", False)) for s in members
+            ),
+            "flat_conversion_applied_count": sum(
+                bool(s.get("flat_conversion_applied")) for s in members
+            ),
+            "flat_conversion_valid_rate": mean(
+                float(bool(s.get("flat_conversion_valid"))) for s in members
+            ),
             "final_strict_tool_set_exact_rate": mean(float(s["tool_set_exact_match"]) for s in members),
+            "final_ast_exact_rate": mean(
+                float(s.get("bfcl_ast_compatible_match", False)) for s in members
+            ),
             "final_raw_tool_set_exact_rate": mean(float(s["final_raw_tool_set_exact_match"]) for s in members),
             "repaired_json_valid_rate": mean(float(s.get("repaired_json_valid", False)) for s in members),
             "repaired_tool_call_format_valid_rate": mean(float(s.get("repaired_tool_call_format_valid", False)) for s in members),
             "repaired_output_valid_rate": mean(float(s.get("repaired_output_valid", False)) for s in members),
             "repaired_tool_set_exact_rate": mean(float(s.get("repaired_tool_set_exact_match", False)) for s in members),
+            "repaired_ast_exact_rate": mean(
+                float(s.get("repaired_ast_compatible_match", False)) for s in members
+            ),
             "repaired_tool_type_f1": mean(float(s.get("repaired_tool_type_f1", 0.0)) for s in members),
             "final_call_count_match_rate": mean(float(s["tool_call_count_match"]) for s in members),
             "likely_length_truncated_count": sum(bool(s["likely_length_truncated"]) for s in members),
@@ -285,6 +303,144 @@ def _tool_name_rows(samples: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 value[f"correct_first_time_s_{name}"] = metric
             rows.append(value)
     return rows
+
+
+def _dependency_rows(samples: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Aggregate offline semantic dependency metrics for raw/repaired calls."""
+
+    rows = []
+    for group, members in _groups(samples):
+        for variant in ("raw", "repaired"):
+            key = f"semantic_dependency_{variant}"
+            evaluations = [
+                sample[key] for sample in members if isinstance(sample.get(key), dict)
+            ]
+            if not evaluations:
+                continue
+            tp = sum(int(value["edge_true_positive_count"]) for value in evaluations)
+            fp = sum(int(value["edge_false_positive_count"]) for value in evaluations)
+            fn = sum(int(value["edge_false_negative_count"]) for value in evaluations)
+            micro_precision = tp / (tp + fp) if tp + fp else 0.0
+            micro_recall = tp / (tp + fn) if tp + fn else 1.0
+            micro_f1 = (
+                2 * micro_precision * micro_recall
+                / (micro_precision + micro_recall)
+                if micro_precision + micro_recall else 0.0
+            )
+            reference_count = sum(int(v["reference_count"]) for v in evaluations)
+            valid_reference_count = sum(
+                int(v["valid_reference_count"]) for v in evaluations
+            )
+            audits = [
+                sample.get("ground_truth_dependency_reference_audit", {})
+                for sample in members
+            ]
+            row = {
+                "group": group,
+                "variant": variant,
+                "sample_count": len(evaluations),
+                "output_valid_rate": mean(
+                    float(value["output_valid"]) for value in evaluations
+                ),
+                "samples_with_reference_count": sum(
+                    int(value["reference_count"] > 0) for value in evaluations
+                ),
+                "samples_with_reference_rate": mean(
+                    float(value["reference_count"] > 0) for value in evaluations
+                ),
+                "reference_count": reference_count,
+                "valid_reference_count": valid_reference_count,
+                "invalid_reference_count": sum(
+                    int(value["invalid_reference_count"]) for value in evaluations
+                ),
+                "malformed_reference_count": sum(
+                    int(value["malformed_reference_count"]) for value in evaluations
+                ),
+                "valid_reference_rate": (
+                    valid_reference_count / reference_count
+                    if reference_count else None
+                ),
+                "dependency_edge_precision_macro": mean(
+                    float(value["dependency_edge_precision"])
+                    for value in evaluations
+                ),
+                "dependency_edge_recall_macro": mean(
+                    float(value["dependency_edge_recall"])
+                    for value in evaluations
+                ),
+                "dependency_edge_f1_macro": mean(
+                    float(value["dependency_edge_f1"])
+                    for value in evaluations
+                ),
+                "dependency_edge_precision_micro": micro_precision,
+                "dependency_edge_recall_micro": micro_recall,
+                "dependency_edge_f1_micro": micro_f1,
+                "dependency_edge_exact_match_rate": mean(
+                    float(value["dependency_edge_exact_match"])
+                    for value in evaluations
+                ),
+                "semantic_plan_exact_match_rate": mean(
+                    float(value["semantic_plan_exact_match"])
+                    for value in evaluations
+                ),
+                "ordered_semantic_plan_exact_match_rate": mean(
+                    float(value["ordered_semantic_plan_exact_match"])
+                    for value in evaluations
+                ),
+                "valid_semantic_plan_exact_match_rate": mean(
+                    float(value["valid_semantic_plan_exact_match"])
+                    for value in evaluations
+                ),
+                "valid_ordered_semantic_plan_exact_match_rate": mean(
+                    float(value["valid_ordered_semantic_plan_exact_match"])
+                    for value in evaluations
+                ),
+                "edge_true_positive_count": tp,
+                "edge_false_positive_count": fp,
+                "edge_false_negative_count": fn,
+                "ground_truth_literal_reference_count": sum(
+                    int(value.get("reference_count", 0)) for value in audits
+                ),
+                "ground_truth_literal_non_backward_count": sum(
+                    int(value.get("non_backward_reference_count", 0))
+                    for value in audits
+                ),
+                "literal_ast_exact_rate": mean(float(
+                    sample.get(
+                        "bfcl_ast_compatible_match" if variant == "raw"
+                        else "repaired_ast_compatible_match",
+                        False,
+                    )
+                ) for sample in members),
+            }
+            rows.append(row)
+    return rows
+
+
+def write_dependency_report(
+    output_dir: str | Path, samples: list[dict[str, Any]]
+) -> None:
+    """Write semantic dependency summaries and auditable per-sample edges."""
+
+    output = Path(output_dir)
+    rows = _dependency_rows(samples)
+    if not rows:
+        return
+    _write_csv(output / "taskbench_dependency_summary.csv", rows)
+    with (output / "taskbench_dependency_edges.jsonl").open(
+        "w", encoding="utf-8"
+    ) as handle:
+        for sample in samples:
+            for variant in ("raw", "repaired"):
+                value = sample.get(f"semantic_dependency_{variant}")
+                if not isinstance(value, dict):
+                    continue
+                handle.write(json.dumps({
+                    "sample_id": sample["sample_id"],
+                    "graph_type": sample.get("graph_type"),
+                    "variant": variant,
+                    **value,
+                }, ensure_ascii=False) + "\n")
 
 
 def _figures(output: Path, methods: list[dict[str, Any]],
@@ -384,6 +540,7 @@ def build_taskbench_report(output_dir: str | Path) -> None:
     _write_csv(output / "taskbench_position_summary.csv", position_rows)
     _write_csv(output / "taskbench_generation_summary.csv", generation_rows)
     _write_csv(output / "taskbench_tool_name_summary.csv", tool_name_rows)
+    write_dependency_report(output, samples)
     with (output / "taskbench_special_name_failures.jsonl").open(
         "w", encoding="utf-8"
     ) as handle:
@@ -406,4 +563,7 @@ def build_taskbench_report(output_dir: str | Path) -> None:
     _figures(output, method_rows, position_rows, samples)
 
 
-__all__ = ["build_taskbench_report", "load_jsonl", "percentile", "stats"]
+__all__ = [
+    "build_taskbench_report", "load_jsonl", "percentile", "stats",
+    "write_dependency_report",
+]

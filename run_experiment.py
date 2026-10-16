@@ -13,6 +13,7 @@ import subprocess
 import sys
 import time
 from typing import Any
+from collections.abc import Sequence
 
 import numpy as np
 import torch
@@ -20,6 +21,7 @@ import torch
 from bfcl_data import BFCLSample, iter_samples, validate_dataset
 from evaluation import analyze_observer, evaluate_final_calls
 from fastdllm_generate import generate, generate_with_dual_cache
+from model_adapter import load_model_and_tokenizer, runtime_spec
 from observer import ToolCallObserver
 from prompting import render_prompt
 from report import build_summary
@@ -99,28 +101,28 @@ def _git_head(path: str | Path) -> str | None:
 
 
 def _load_model(args: argparse.Namespace, device: torch.device):
-    from transformers import AutoTokenizer
-
-    llada_dir = Path(args.fastdllm_root).resolve() / "v1" / "llada"
-    if not (llada_dir / "model" / "modeling_llada.py").exists():
-        raise FileNotFoundError(f"Fast-dLLM v1 LLaDA implementation not found: {llada_dir}")
-    sys.path.insert(0, str(llada_dir))
-    from model.modeling_llada import LLaDAModelLM
-
     dtype = {
         "bfloat16": torch.bfloat16,
         "float16": torch.float16,
         "float32": torch.float32,
     }[args.dtype]
-    tokenizer = AutoTokenizer.from_pretrained(
-        args.model_path, trust_remote_code=True, local_files_only=True
+    raw_memory = getattr(args, "max_memory_json", None)
+    max_memory = None
+    if raw_memory:
+        max_memory = {int(k) if k.isdecimal() else k: v for k, v in json.loads(raw_memory).items()}
+    model, tokenizer, spec = load_model_and_tokenizer(
+        model_path=args.model_path,
+        fastdllm_root=args.fastdllm_root,
+        dtype=dtype,
+        device=device,
+        cache_mode=getattr(args, "cache_mode", "none"),
+        device_map=getattr(args, "device_map", None), max_memory=max_memory,
     )
-    model = LLaDAModelLM.from_pretrained(
-        args.model_path,
-        trust_remote_code=True,
-        torch_dtype=dtype,
-        local_files_only=True,
-    ).to(device).eval()
+    args.model_path_resolved = spec.resolved_path
+    args.model_family = spec.family
+    args.model_runtime = spec.to_dict()
+    if getattr(model, "hf_device_map", None) is not None:
+        args.model_device_map = {k: str(v) for k, v in model.hf_device_map.items()}
     return model, tokenizer
 
 
@@ -133,12 +135,19 @@ def _generate_once(
     observer: ToolCallObserver | None,
     seed: int,
     device: torch.device,
+    generation_prefix_ids: Sequence[int] | None = None,
 ) -> tuple[torch.Tensor, int, float]:
     _seed_everything(seed)
     _sync(device)
     started = time.perf_counter()
     with torch.inference_mode():
         cache_mode = getattr(args, "cache_mode", "none")
+        spec = runtime_spec(model)
+        if cache_mode == "dual" and not spec.supports_dual_cache:
+            raise ValueError(
+                f"Dual Cache is not supported for model family {spec.family!r}; "
+                "use --cache-mode none"
+            )
         generate_fn = {
             "none": generate,
             "dual": generate_with_dual_cache,
@@ -157,6 +166,7 @@ def _generate_once(
             threshold=None,
             factor=None,
             observation_callback=observer,
+            generation_prefix_ids=generation_prefix_ids,
         )
     _sync(device)
     return output, nfe, time.perf_counter() - started
@@ -174,12 +184,13 @@ def _run_sample(
 ) -> dict[str, Any]:
     rendered = render_prompt(tokenizer, sample)
     prompt_ids = tokenizer(rendered, return_tensors="pt").input_ids.to(device)
-    if prompt_ids.shape[1] + args.gen_length > getattr(model.config, "max_sequence_length", 4096):
+    spec = runtime_spec(model)
+    if prompt_ids.shape[1] + args.gen_length > spec.max_sequence_length:
         raise ValueError(
             f"{sample.sample_id}: prompt+generation exceeds model context: "
             f"{prompt_ids.shape[1]}+{args.gen_length}"
         )
-    mask_id = getattr(model.config, "mask_token_id", None) or 126336
+    mask_id = spec.mask_token_id
     full_logits_dir = (
         output_dir / "full_logits" / sample.sample_id
         if args.save_full_logits

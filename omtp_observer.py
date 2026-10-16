@@ -19,6 +19,7 @@ import torch
 
 from fastdllm_generate import ForwardObservation
 from observer import ToolCallObserver
+from prefix_detection import CommittedPrefixMatcher
 
 
 @dataclass(frozen=True)
@@ -77,12 +78,15 @@ class OMTPObserver:
         stable_n: int = 2,
         config: OMTPConfig | None = None,
         profile_enabled: bool = False,
+        record_history: bool = True,
     ) -> None:
         self.tokenizer = tokenizer
         self.candidate_names = list(dict.fromkeys(str(x) for x in candidate_names))
         self.config = config or OMTPConfig(stable_n=stable_n)
         self.config.validate()
         self.profile_enabled = bool(profile_enabled)
+        self.record_history = record_history
+        self.forward_count = 0
         self.profile_stats: dict[str, dict[str, float | int]] = {}
         self.profile_transfer_bytes = {"gpu_to_cpu": 0, "cpu_to_gpu": 0}
         self.baseline = ToolCallObserver(
@@ -101,6 +105,8 @@ class OMTPObserver:
             name: tuple(self._encode(name + '"'))
             for name in self.candidate_names
         }
+        self._prefix_matcher = CommittedPrefixMatcher(tokenizer, self.candidate_names)
+        self._prefix_evidence: dict[int, dict[str, Any]] = {}
         self._anchor_variants = self._build_anchor_variants()
         self.tracks: list[dict[str, Any]] = []
         self.trajectory: list[dict[str, Any]] = []
@@ -108,6 +114,11 @@ class OMTPObserver:
         self.latent_events: list[dict[str, Any]] = []
         self.fallback_commits: dict[int, dict[str, Any]] = {}
         self.natural_available_by_tool: dict[str, float] = {}
+        # One causal first detection per tool identity, independent of tracks.
+        # This is a record of triggers, not a real tool/service controller.
+        self.first_tool_events: dict[str, dict[str, Any]] = {}
+        self.natural_first_events: dict[str, dict[str, Any]] = {}
+        self._dual_prompt_offset: int | None = None
         self.omtp_processing_s = 0.0
         self.total_processing_s = 0.0
         self._callback_started = 0.0
@@ -148,7 +159,7 @@ class OMTPObserver:
             self.profile_transfer_bytes[direction] += int(bytes_count)
 
     def profile_summary(self) -> dict[str, Any]:
-        forwards = max(1, len(self.steps))
+        forwards = max(1, self.forward_count)
         modules = {}
         for name, values in self.profile_stats.items():
             total = float(values["total_s"])
@@ -159,7 +170,7 @@ class OMTPObserver:
             }
         return {
             "enabled": self.profile_enabled,
-            "forward_count": len(self.steps),
+            "forward_count": self.forward_count,
             "modules": modules,
             "transfer_bytes": dict(self.profile_transfer_bytes),
         }
@@ -215,7 +226,21 @@ class OMTPObserver:
 
     def __call__(self, observation: ForwardObservation) -> None:
         callback_start = time.perf_counter()
+        self.forward_count += 1
+        if observation.cache_mode == "dual" and self._dual_prompt_offset is None:
+            self._dual_prompt_offset = observation.sequence_offset
+        self._callback_started = callback_start
+        self._callback_base_s = observation.commit_elapsed_s
         self.baseline(observation)
+        baseline_step = self.baseline.steps[-1]
+        for name in baseline_step["committed_tool_types"]:
+            event = {
+                "predicted_tool": name, "source": "natural",
+                "forward_step": observation.forward_index,
+                "predict_time_s": baseline_step["prediction_available_time_s"],
+            }
+            self.natural_first_events.setdefault(name, event)
+            self.first_tool_events.setdefault(name, event)
         omtp_start = time.perf_counter()
         self._callback_started = callback_start
         self._callback_base_s = observation.commit_elapsed_s
@@ -235,6 +260,10 @@ class OMTPObserver:
         step["omtp_fallback_committed_tools"] = sorted(
             {event["predicted_tool"] for event in self.fallback_commits.values()}
         )
+        if not self.record_history:
+            # Scoring needs only the current committed IDs, never past steps.
+            self.baseline.steps[:] = [step]
+            self.trajectory.clear()
 
     def _temporary_ids(self, observation: ForwardObservation) -> torch.Tensor:
         generation = observation.committed_x[0, observation.prompt_length:]
@@ -464,23 +493,17 @@ class OMTPObserver:
                         ).lstrip().startswith('"')
                     ):
                         natural = (name, prompt + start)
-                visible = []
-                for offset, token_id in enumerate(ids):
-                    position = start + offset
-                    if position >= len(generation):
-                        break
-                    actual = int(generation[position])
-                    if actual == observation.mask_id or actual != token_id:
-                        break
-                    visible.append(token_id)
-                if not visible:
-                    continue
-                matches = [candidate for candidate, candidate_ids in self._candidate_ids.items() if tuple(candidate_ids[:len(visible)]) == tuple(visible)]
-                if len(matches) == 1:
-                    text = self.tokenizer.decode(visible, skip_special_tokens=True)
-                    row = (matches[0], text, prompt + start)
-                    if best_prefix is None or len(visible) > len(self._encode(best_prefix[1])):
-                        best_prefix = row
+        # Prefixes must begin at THIS name field, not an arbitrary nearby
+        # token. Read the whole committed run and reject contradictory suffix
+        # islands rather than salvaging a candidate's shorter matching part.
+        match = self._prefix_matcher.match(generation, center - prompt, observation.mask_id)
+        if match is not None:
+            if observation.cache_mode == "dual":
+                match["generation_position"] += observation.sequence_offset - (
+                    self._dual_prompt_offset if self._dual_prompt_offset is not None else observation.sequence_offset
+                )
+            self._prefix_evidence[center] = match
+            best_prefix = (match["predicted_tool"], match["prefix"], center)
         return best_prefix, natural
 
     def _emit(
@@ -501,6 +524,7 @@ class OMTPObserver:
             **extra,
         }
         self.events.append(event)
+        self.first_tool_events.setdefault(tool, event)
         if source == "latent_region":
             self.latent_events.append(event)
         self.fallback_commits.setdefault(int(track["track_id"]), event)
@@ -586,7 +610,10 @@ class OMTPObserver:
                 track["prefix_triggered"] = True
                 event = self._emit(
                     track=track, source="prefix", tool=prefix[0], observation=observation,
-                    extra={"prefix": prefix[1], "best_position": prefix[2]},
+                    extra={
+                        "prefix": prefix[1], "best_position": prefix[2],
+                        "prefix_validation": dict(self._prefix_evidence[prefix[2]]),
+                    },
                 )
                 row["prefix_event"] = event
             if natural is not None and not track["natural_triggered"]:

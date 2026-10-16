@@ -48,6 +48,107 @@ def test_json_syntax_format_and_candidate_validity_are_separate():
     assert parsed.calls == [{"name": "invented", "arguments": {}}]
 
 
+def test_flat_name_schema_converts_multiple_arguments_and_duplicates():
+    functions = [{
+        "name": "get_weather",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "location": {"type": "string"},
+                "date": {"type": "string"},
+            },
+        },
+    }]
+    parsed = parse_tool_calls(
+        '[{"name":"get_weather","location":"Beijing","date":"today"},'
+        '{"name":"get_weather","location":"Shanghai","date":"tomorrow"}]',
+        ["get_weather"],
+        output_schema="flat_name_v1",
+        functions=functions,
+    )
+    assert parsed.valid
+    assert parsed.calls == [
+        {
+            "name": "get_weather",
+            "arguments": {"location": "Beijing", "date": "today"},
+        },
+        {
+            "name": "get_weather",
+            "arguments": {"location": "Shanghai", "date": "tomorrow"},
+        },
+    ]
+
+
+def test_flat_name_schema_reverses_name_parameter_alias():
+    functions = [{
+        "name": "book_hotel",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "date": {"type": "string"},
+                "name": {"type": "string"},
+            },
+        },
+    }]
+    parsed = parse_tool_calls(
+        '[{"name":"book_hotel","date":"tomorrow","arg_name":"Hilton"}]',
+        ["book_hotel"],
+        output_schema="flat_name_v1",
+        functions=functions,
+    )
+    assert parsed.valid
+    assert parsed.calls == [{
+        "name": "book_hotel",
+        "arguments": {"date": "tomorrow", "name": "Hilton"},
+    }]
+
+
+def test_flat_name_schema_recovers_common_wrong_nesting():
+    functions = [{
+        "name": "edit",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "input_1": {"type": "string"},
+                "input_2": {"type": "string"},
+            },
+            "required": ["input_1", "input_2"],
+        },
+    }]
+    for text in (
+        '[{"name":"edit","parameters":{"input_1":"x","input_2":"y"}}]',
+        '[{"name":"edit","args":{"input_1":"x","input_2":"y"}}]',
+        '[{"name":"edit","input_1":{"input_1":"x","input_2":"y"}}]',
+    ):
+        parsed = parse_tool_calls(
+            text, ["edit"], output_schema="flat_name_v1", functions=functions
+        )
+        assert parsed.valid
+        assert parsed.calls == [{
+            "name": "edit", "arguments": {"input_1": "x", "input_2": "y"}
+        }]
+
+
+def test_flat_name_schema_rejects_missing_invalid_and_conflicting_arguments():
+    functions = [{
+        "name": "edit",
+        "parameters": {
+            "type": "object",
+            "properties": {"input_1": {"type": "string"}},
+            "required": ["input_1"],
+        },
+    }]
+    for text in (
+        '[{"name":"edit"}]',
+        '[{"name":"edit","input_1":42}]',
+        '[{"name":"edit","input_1":"x","args":{"input_1":"y"}}]',
+    ):
+        parsed = parse_tool_calls(
+            text, ["edit"], output_schema="flat_name_v1", functions=functions
+        )
+        assert parsed.json_valid and not parsed.format_valid
+
+
 def test_duplicate_calls_and_unordered_ast_match():
     calls = [
         {"name": "get_weather", "arguments": {"city": "Shanghai"}},

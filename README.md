@@ -2,13 +2,209 @@
 
 本目录实现 LLaDA-8B-Instruct 在 BFCL 非 Live `parallel_multiple` 上的无缓存全局去噪实验。所有新增/修改代码均在本目录；原始 `Fast-dLLM` 工作树（包括其中已有的未提交改动）未被修改。
 
+当前入口与输出格式以 [EXPERIMENT_OUTPUT.md](EXPERIMENT_OUTPUT.md) 为准：
+默认每次只保存一个 `samples.jsonl`，按工具名称记录 OMTP / Prefix / Natural
+中最早的事件，并独立保留自然识别时间。Prefix 已修复共享前缀歧义和已确定后缀冲突。
+下文多文件报告及旧版消融命令属于历史流程；新结果使用 `summarize_experiment.py`，
+不再自动输出 CSV、轨迹文件或图片。已有结果及其离线分析工具保留。
+
+BFCL 已补齐可靠性开关；同 Forward 的四组真实 20 条门控对照结果见
+[BFCL_GATE_ABLATION.md](BFCL_GATE_ABLATION.md)。这批样本上完整门控没有提高
+准确率，平均提前步数由 11.37 降至 7.39，因此没有将其设为 BFCL 默认配置。
+
+OMTP 可靠性逐项开发实验见 [OMTP_RELIABILITY.md](OMTP_RELIABILITY.md)。
+Multimedia 开发集实跑了原版及五轮各 20 条的独立测试，推荐保留可信 Anchor、
+分数门控和新 Natural 工具追加。运行时显式添加
+`--omtp-strict-anchor --omtp-min-top1-score -5 --omtp-min-margin 0.1 --omtp-append-natural`；
+不添加这些开关仍复现原版。开发集 GT Precision/F1 为 85.25%/86.87%，
+相对最终 Raw Text 的 Precision 为 93.58%；二者不能混为任务或集合准确率。
+
 ## 已核对的本机状态
 
 - Fast-dLLM：`/data/home/yzx/Fast-dLLM`，审计时 commit 为 `aadcf060e12b6413b494bf9aebb172cfe3cf911c`。
 - 权重：`/data/labshare/Param/llada`，配置为 32 层、8B、BF16、`mask_token_id=126336`、上下文 4096。
 - 模型实现：运行时从 `Fast-dLLM/v1/llada/model` 导入；无缓存生成/transfer 代码复制在 `fastdllm_generate.py` 中。
 - 实验节点有 8 张 RTX 3090；OMTP smoke 使用 GPU 0 实际完成。若受限沙箱内 `nvidia-smi` 报驱动不可访问，需要在具备 GPU device 权限的终端运行命令。
-- 本机 `llada` conda 环境审计时为 Python 3.10、Torch 2.11.0+cu130、Transformers 4.38.2；Fast-dLLM v1 的仓库要求是 Transformers 4.49.0，正式复现前建议对齐依赖。
+- 本机 `llada` conda 环境当前为 Python 3.10、Torch 2.11.0+cu130、Transformers 4.49.0，已与 Fast-dLLM v1 的仓库要求对齐。
+
+## 可替换的模型后端
+
+`--model-path` 现在会根据 checkpoint 的 `config.json` 自动选择模型实现，
+并从模型自己的 config/tokenizer 解析 MASK、EOS、PAD、词表大小和上下文上限。
+OMTP 候选名称也始终用当前模型的 tokenizer 重新编码，不再依赖 LLaDA-8B
+的固定 token ID。
+
+| 模型 | 本地路径 | 加载方式 | MASK / 上下文 | Cache 支持 |
+|---|---|---|---|---|
+| LLaDA-8B-Instruct | `/data/labshare/Param/llada` | Fast-dLLM v1 `LLaDAModelLM` | config 自动读取（当前为 126336 / 4096） | No Cache、Dual Cache |
+| LLaDA 1.5 8B | `/data/labshare/Param/llada1.5` | Fast-dLLM v1 `LLaDAModelLM` | config 自动读取（当前为 126336 / 4096） | No Cache、Dual Cache |
+| iLLaDA-8B-Instruct | `/data/labshare/Param/iLLADA-8B-Instruct` | checkpoint 自带 `ILLaDAForCausalLM` | tokenizer/config 自动读取（当前为 5 / 8192） | No Cache |
+
+本机的 LLaDA 1.5 来自官方 `GSAI-ML/LLaDA-1.5`，下载时固定 revision
+`84346fd91ba60252d260022201ad6fc5a3468fb2`，而不是浮动的 `main`。
+现有 iLLaDA checkpoint 的本地 Hugging Face metadata 记录 revision 为
+`5769f049224b2cff61106ebce0429ede5deeb434`。
+
+iLLaDA 的现有目录外面多包了一层，程序会自动解析到唯一包含
+`config.json` 的子目录。它的原生 chat template 不支持 system role；仅对这一已知
+错误，`prompting.py` 会把 system 指令和原 user 内容合并成一个 user turn，再调用
+原生 template。LLaDA/LLaDA 1.5 的消息结构保持不变。
+
+iLLaDA 的网络结构和 KV 维度不同，不能安全套用当前只为
+`LLaDAModelLM` 实现的 Dual Cache；选择 `--cache-mode dual` 会在生成前明确报错，
+不会静默退化或产生不可比较结果。三种模型都可以使用相同的 No Cache 命令，
+只需替换 `--model-path`，并为结果使用独立目录。例如 TaskBench：
+
+```bash
+# LLaDA 1.5
+CUDA_VISIBLE_DEVICES=0 python run_taskbench_experiment.py \
+  --manifest data/taskbench/data_huggingface/splits/formal200.jsonl \
+  --tool-catalog data/taskbench/data_huggingface/tool_desc.json \
+  --model-path /data/labshare/Param/llada1.5 \
+  --fastdllm-root /data/home/yzx/Fast-dLLM \
+  --output-dir results/taskbench_huggingface_llada15_nocache \
+  --cache-mode none --prompt-profile compact_json_v3 \
+  --generation-profile fixed128 --parity-samples 1
+
+# iLLaDA（外层路径和内层实际 checkpoint 路径均可）
+CUDA_VISIBLE_DEVICES=0 python run_taskbench_experiment.py \
+  --manifest data/taskbench/data_huggingface/splits/formal200.jsonl \
+  --tool-catalog data/taskbench/data_huggingface/tool_desc.json \
+  --model-path /data/labshare/Param/iLLADA-8B-Instruct \
+  --fastdllm-root /data/home/yzx/Fast-dLLM \
+  --output-dir results/taskbench_huggingface_illada_nocache \
+  --cache-mode none --prompt-profile compact_json_v3 \
+  --generation-profile fixed128 --parity-samples 1
+```
+
+### iLLaDA 直接 JSON 响应消融
+
+iLLaDA checkpoint 没有等价于 `enable_thinking=False` 的原生开关。为测试不先生成
+`<think>` 的效果，程序提供显式的 `--response-mode json_prefill`：在 128-token
+生成区开头提交纯结构前缀 `[{"name":"`，余下位置仍按原 No Cache 算法去噪。
+它不修改 Prompt、不包含候选或正确工具名、不增加 Forward；前缀会保留在
+`raw_output` 中并由 JSON 评测正常检查。该模式改变了解码初始条件，所以结果会在
+逐样本记录和 `metadata.json` 中标记，必须作为独立消融报告。默认的
+`--response-mode native` 完全保持原生行为。
+
+20 条 HuggingFace smoke：
+
+```bash
+cd /data/home/yzx/dLLM_Toolcall
+CUDA_VISIBLE_DEVICES=0 python run_taskbench_experiment.py \
+  --manifest data/taskbench/data_huggingface/splits/smoke20.jsonl \
+  --tool-catalog data/taskbench/data_huggingface/tool_desc.json \
+  --model-path /data/labshare/Param/iLLADA-8B-Instruct \
+  --fastdllm-root /data/home/yzx/Fast-dLLM \
+  --output-dir results/taskbench_huggingface_illada_json_prefill_smoke20 \
+  --cache-mode none --response-mode json_prefill \
+  --prompt-profile compact_json_v3 --generation-profile fixed128 \
+  --parity-samples 1
+```
+
+重点检查 `taskbench_generation_summary.csv` 中的 raw/repair JSON 合法率，并在
+`taskbench_samples.jsonl` 中确认 `response_mode=json_prefill`、
+`generation_prefix_is_model_generated=false`、`forward_count=32` 和 parity 字段。
+
+### 扁平 Tool Call 输出格式
+
+`--output-schema flat_name_v1` 保留 OMTP 使用的外层 `"name"` 字段，但把参数
+直接放在同一个调用对象中。候选定义会渲染为无 `parameters` 包装的函数签名，
+Prompt 同时提供签名到扁平 JSON 的正向示例。例如模型输出：
+
+```json
+[{"name":"get_weather","location":"Beijing","date":"tomorrow"}]
+```
+
+程序在生成结束后确定性转换为：
+
+```json
+[{"name":"get_weather","arguments":{"location":"Beijing","date":"tomorrow"}}]
+```
+
+转换不进入 Prompt、Forward 或 OMTP 事件计时。原始模型对象保存在
+`model_output_tool_calls`，标准对象保存在 `converted_standard_tool_calls`。
+若工具的参数本身叫 `name`，Prompt 签名会生成无冲突别名（当前为
+`arg_name`），转换时自动还原。兼容转换器还会递归识别模型误加的
+`parameters`、`arguments`、`args`、`input` 或其他可由 Schema 确认的嵌套层；
+最终只有候选工具名、必需参数、字段名和 JSON 类型通过验证的标准调用才标记为
+转换成功。未知多余字段会从标准调用中丢弃，但原始模型输出始终保留。
+默认 `--output-schema standard` 保持旧格式不变。
+
+使用 LLaDA 1.5 运行同一批 HuggingFace 20 条配对 Smoke：
+
+```bash
+cd /data/home/yzx/dLLM_Toolcall
+CUDA_VISIBLE_DEVICES=0 python run_taskbench_experiment.py \
+  --manifest data/taskbench/data_huggingface/splits/smoke20.jsonl \
+  --tool-catalog data/taskbench/data_huggingface/tool_desc.json \
+  --model-path /data/labshare/Param/llada1.5 \
+  --fastdllm-root /data/home/yzx/Fast-dLLM \
+  --output-dir results/taskbench_huggingface_llada15_flat_name_smoke20 \
+  --cache-mode none --response-mode native \
+  --output-schema flat_name_v1 --prompt-profile compact_json_v3 \
+  --generation-profile fixed128 --parity-samples 1
+```
+
+也可将单独保存的扁平 JSON 转为标准 Tool Call：
+
+```bash
+python convert_flat_tool_calls.py \
+  --input flat_calls.json \
+  --tool-catalog data/taskbench/data_huggingface/tool_desc.json \
+  --output standard_calls.json
+```
+
+TaskBench 的依赖感知 Prompt 作为独立的 `compact_json_dep_v4` 保留，不覆盖
+`compact_json_v3` 基线。它仍输出相同的扁平 `{name, ...inputs}` 数组，只用
+`<node-N>` 表示对数组中更早一次调用输出的引用，不增加 `depends_on` 字段，也不
+改变 OMTP 的 `"name"` Anchor。例如：
+
+```json
+[{"name":"Image-to-Text","input_1":"example.jpg"},{"name":"Summarization","input_1":"<node-0>"}]
+```
+
+运行依赖感知的 LLaDA 1.5 Smoke Test：
+
+```bash
+cd /data/home/yzx/dLLM_Toolcall
+CUDA_VISIBLE_DEVICES=0 python run_taskbench_experiment.py \
+  --manifest data/taskbench/data_huggingface/splits/smoke20.jsonl \
+  --tool-catalog data/taskbench/data_huggingface/tool_desc.json \
+  --model-path /data/labshare/Param/llada1.5 \
+  --fastdllm-root /data/home/yzx/Fast-dLLM \
+  --output-dir results/taskbench_huggingface_llada15_flat_name_dep_v4_smoke20 \
+  --cache-mode none --response-mode native \
+  --output-schema flat_name_v1 --prompt-profile compact_json_dep_v4 \
+  --generation-profile fixed128 --parity-samples 1
+```
+
+Prompt 只说明引用语法并提供正向示例，不包含样本 Ground Truth、实际依赖边或
+参考执行计划。当前转换器会把 `<node-N>` 原样保存在标准 `arguments` 中。
+
+依赖正确性使用独立的离线语义评测：按模型生成数组的 0-based 顺序把
+`<node-N>` 恢复为“第 N 个调用的工具 → 当前工具”，再与 TaskBench 的
+`dependency_edges` 比较。它不要求模型引用字符串与官方 `tool_nodes` 中的字面
+编号一致，也不修改 Prompt、OMTP、模型输出或计时。每次新实验会额外生成：
+
+- `taskbench_dependency_summary.csv`：Raw/Repair 的依赖边 Precision、Recall、
+  F1、Exact Match，以及工具集合/顺序与依赖边联合正确率。
+- `taskbench_dependency_edges.jsonl`：逐样本有效、越界、自引用、格式错误引用和
+  TP/FP/FN 边。
+
+`Literal AST` 指标继续保留。对旧实验目录可直接离线补算，不必重新推理：
+
+```bash
+python evaluate_taskbench_dependencies.py \
+  --result-dir results/taskbench_huggingface_llada15_flat_name_dep_v4_smoke20 \
+  --manifest data/taskbench/data_huggingface/splits/smoke20.jsonl \
+  --tool-catalog data/taskbench/data_huggingface/tool_desc.json
+```
+
+每轮的 `metadata.json` 会保存 requested/resolved model path、模型 family、
+architecture、MASK/EOS/PAD、词表大小、上下文上限以及 Dual Cache 能力，便于确认
+实际运行的不是错误 checkpoint。更换模型会改变生成质量、时间和中间 logits，
+因此不同模型必须分别报告结果，不能和原 LLaDA run 混写到同一目录。
 
 ## 数据与 Prompt
 
@@ -340,6 +536,11 @@ revision `d12764a8fa650f49f50507a02c3e707c71c67621`；预先生成的 Smoke 20
 23 工具目录，Multimedia 使用完整 40 工具目录。Ground Truth、依赖边和参考
 执行步骤都不会进入 Prompt。
 
+`--prompt-profile original` 精确复现最初结果，`strict_json_v2` 保留此前严格
+Prompt 消融；当前默认 `compact_json_v3`。紧凑版本继续将 Schema 标准化为
+`{"type":"object"}`，只正向说明 JSON 数组及 `name`/`arguments` 结构，让模型
+根据函数参数 Schema 生成输入；不加入候选名 enum、参数长度规定或负向禁止条款。
+
 校验已经下载的官方原始文件及其 SHA（首次获取时去掉 `--verify-only`）：
 
 ```bash
@@ -371,6 +572,7 @@ CUDA_VISIBLE_DEVICES=0 /home/yzx/miniconda3/envs/llada/bin/python \
   --tool-catalog data/taskbench/data_huggingface/tool_desc.json \
   --model-path /data/labshare/Param/llada \
   --fastdllm-root /data/home/yzx/Fast-dLLM --cache-mode none \
+  --prompt-profile original \
   --output-dir results/taskbench_huggingface_smoke20_nocache_fixed \
   --parity-samples 1
 
@@ -380,6 +582,7 @@ CUDA_VISIBLE_DEVICES=0 /home/yzx/miniconda3/envs/llada/bin/python \
   --tool-catalog data/taskbench/data_multimedia/tool_desc.json \
   --model-path /data/labshare/Param/llada \
   --fastdllm-root /data/home/yzx/Fast-dLLM --cache-mode none \
+  --prompt-profile original \
   --output-dir results/taskbench_multimedia_smoke20_nocache_fixed \
   --parity-samples 1
 ```
@@ -393,6 +596,7 @@ CUDA_VISIBLE_DEVICES=0 /home/yzx/miniconda3/envs/llada/bin/python \
   --tool-catalog data/taskbench/data_huggingface/tool_desc.json \
   --model-path /data/labshare/Param/llada \
   --fastdllm-root /data/home/yzx/Fast-dLLM --cache-mode none \
+  --prompt-profile original \
   --output-dir results/taskbench_huggingface_formal200_nocache_fixed \
   --parity-samples 1
 
@@ -402,6 +606,7 @@ CUDA_VISIBLE_DEVICES=0 /home/yzx/miniconda3/envs/llada/bin/python \
   --tool-catalog data/taskbench/data_multimedia/tool_desc.json \
   --model-path /data/labshare/Param/llada \
   --fastdllm-root /data/home/yzx/Fast-dLLM --cache-mode none \
+  --prompt-profile original \
   --output-dir results/taskbench_multimedia_formal200_nocache_fixed \
   --parity-samples 1
 ```
@@ -421,6 +626,48 @@ CUDA_VISIBLE_DEVICES=0 /home/yzx/miniconda3/envs/llada/bin/python \
 漏检，不能单凭一条漏检断言是 Anchor 错误。Multimedia 目录里存在已知 Prefix
 关系 `Image Search` / `Image Search (by Image)`，保留原始名字且不为它改算法。
 
+### Strict JSON Prompt V2 消融
+
+在相同 128/128/32 Smoke 样本上测试新 Prompt，并使用独立目录：
+
+```bash
+for domain in huggingface multimedia; do
+  CUDA_VISIBLE_DEVICES=0 /home/yzx/miniconda3/envs/llada/bin/python \
+    run_taskbench_experiment.py \
+    --manifest data/taskbench/data_${domain}/splits/smoke20.jsonl \
+    --tool-catalog data/taskbench/data_${domain}/tool_desc.json \
+    --model-path /data/labshare/Param/llada \
+    --fastdllm-root /data/home/yzx/Fast-dLLM \
+    --cache-mode none --generation-profile fixed128 \
+    --prompt-profile strict_json_v2 \
+    --output-dir results/taskbench_${domain}_smoke20_nocache_prompt_v2 \
+    --parity-samples 1
+done
+```
+
+新 Prompt 后的最大上下文长度（含 128 生成区）分别为 HuggingFace 2620、
+Multimedia 3268，仍低于模型 4096 上限。
+
+### Compact JSON Prompt V3
+
+只考察最终 JSON 合法性时，使用默认的紧凑 Prompt。V2 仍可显式选择，不会被
+覆盖。两个领域的配对 Smoke Test 命令如下：
+
+```bash
+for domain in huggingface multimedia; do
+  CUDA_VISIBLE_DEVICES=0 /home/yzx/miniconda3/envs/llada/bin/python \
+    run_taskbench_experiment.py \
+    --manifest data/taskbench/data_${domain}/splits/smoke20.jsonl \
+    --tool-catalog data/taskbench/data_${domain}/tool_desc.json \
+    --model-path /data/labshare/Param/llada \
+    --fastdllm-root /data/home/yzx/Fast-dLLM \
+    --cache-mode none --generation-profile fixed128 \
+    --prompt-profile compact_json_v3 \
+    --output-dir results/taskbench_${domain}_smoke20_nocache_prompt_v3 \
+    --parity-samples 1
+done
+```
+
 ### 256-token 独立诊断组
 
 主实验默认仍是 `fixed128`。若要判断输出预算对 JSON 和工具集合正确率的影响，
@@ -437,6 +684,7 @@ for domain in huggingface multimedia; do
     --model-path /data/labshare/Param/llada \
     --fastdllm-root /data/home/yzx/Fast-dLLM \
     --cache-mode none --generation-profile diagnostic256 \
+    --prompt-profile original \
     --output-dir results/taskbench_${domain}_smoke20_nocache_256diag \
     --parity-samples 1
 done

@@ -19,6 +19,8 @@ def evaluate_json_repair(
     text: str,
     candidate_names: Iterable[str],
     sample: Any,
+    *,
+    output_schema: str = "standard",
 ) -> dict[str, Any]:
     """Repair a completed generation and evaluate it without online feedback.
 
@@ -29,7 +31,10 @@ def evaluate_json_repair(
     """
 
     candidate_names = list(candidate_names)
-    original = parse_tool_calls(text, candidate_names)
+    original = parse_tool_calls(
+        text, candidate_names,
+        output_schema=output_schema, functions=sample.functions,
+    )
     attempted = not original.json_valid
     started = time.perf_counter()
     repair_exception = None
@@ -42,13 +47,17 @@ def evaluate_json_repair(
         repair_exception = f"{type(error).__name__}: {error}"
     elapsed_s = time.perf_counter() - started
 
-    parsed = parse_tool_calls(repaired_text, candidate_names)
+    parsed = parse_tool_calls(
+        repaired_text, candidate_names,
+        output_schema=output_schema, functions=sample.functions,
+    )
     repaired_calls = parsed.calls if parsed.format_valid else []
     quality = evaluate_final_calls(sample, repaired_calls)
     return {
         "json_repair_library": "json-repair",
         "json_repair_version": JSON_REPAIR_VERSION,
         "json_repair_offline_only": True,
+        "json_repair_output_schema": output_schema,
         "json_repair_attempted": attempted,
         "json_repair_changed": repaired_text != text,
         "json_repair_processing_time_s": elapsed_s,

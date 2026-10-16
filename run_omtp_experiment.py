@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime
-import json
 from pathlib import Path
 import platform
 import sys
@@ -19,8 +18,13 @@ from omtp_evaluation import (
 )
 from omtp_observer import OMTPConfig, OMTPObserver
 from optimized_omtp_observer import OptimizedOMTPObserver
-from omtp_report import build_omtp_report
+from reliable_omtp_observer import ReliableOMTPObserver, add_reliability_arguments, reliability_options
+from prefix_detection import audit_prefix_event
+from experiment_output import compact_sample, failure_sample, open_result_file, write_record
+from model_adapter import runtime_spec
 from prompting import render_prompt
+from response_prefill import RESPONSE_MODES, resolve_response_prefill
+from tool_format import OUTPUT_SCHEMAS, model_call_items, parameter_aliases
 from run_experiment import (
     _decode_completion, _generate_once, _git_head, _load_model, _sha256,
 )
@@ -44,6 +48,20 @@ def parse_args() -> argparse.Namespace:
         "--cache-mode", choices=("none", "dual"), default="none",
         help="Fast-dLLM v1 generation path; OMTP itself is unchanged.",
     )
+    parser.add_argument(
+        "--response-mode", choices=RESPONSE_MODES, default="native",
+        help=(
+            "native leaves decoding unchanged; json_prefill is an explicit "
+            "iLLaDA-only structural-prefix ablation."
+        ),
+    )
+    parser.add_argument(
+        "--output-schema", choices=OUTPUT_SCHEMAS, default="standard",
+        help=(
+            "standard emits name/arguments objects; flat_name_v1 keeps name "
+            "and places parameters directly in each call object."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=20261009)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--dtype", choices=("bfloat16", "float16", "float32"), default="bfloat16")
@@ -57,9 +75,21 @@ def parse_args() -> argparse.Namespace:
         "--profile-observer", action="store_true",
         help="Synchronize at OMTP module boundaries and record a diagnostic profile.",
     )
+    # Keep legacy spellings while exposing the same reliability switches as TaskBench.
+    add_reliability_arguments(parser)
     parser.add_argument("--min-top1-score", type=float, default=None)
     parser.add_argument("--min-margin", type=float, default=None)
-    return parser.parse_args()
+    parser.add_argument("--device-map", choices=("auto",), default=None)
+    parser.add_argument("--max-memory-json", default=None, help='Optional Accelerate limits, e.g. {"0":"3GiB","cpu":"32GiB"}.')
+    parser.add_argument("--debug-output", action="store_true", help="Include full forward trajectories inside samples.jsonl.")
+    args = parser.parse_args()
+    for field in ("min_top1_score", "min_margin"):
+        modern = getattr(args, "omtp_" + field)
+        legacy = getattr(args, field)
+        if modern is not None and legacy is not None and modern != legacy:
+            parser.error(f"conflicting values for {field}")
+        setattr(args, field, modern if modern is not None else legacy)
+    return args
 
 
 def _run_sample(
@@ -69,13 +99,28 @@ def _run_sample(
     model: Any,
     tokenizer: Any,
     device: torch.device,
+    *, observer_factory: Any = None,
 ) -> tuple[dict[str, Any], OMTPObserver]:
-    prompt = render_prompt(tokenizer, sample)
+    prompt = render_prompt(
+        tokenizer,
+        sample,
+        getattr(args, "prompt_profile", "original"),
+        getattr(args, "output_schema", "standard"),
+    )
     prompt_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(device)
-    if prompt_ids.shape[1] + args.gen_length > getattr(model.config, "max_sequence_length", 4096):
+    spec = runtime_spec(model)
+    response_prefill = resolve_response_prefill(
+        tokenizer,
+        model_family=spec.family,
+        mode=getattr(args, "response_mode", "native"),
+    )
+    if prompt_ids.shape[1] + args.gen_length > spec.max_sequence_length:
         raise ValueError(f"{sample.sample_id}: prompt plus generation exceeds context")
-    mask_id = getattr(model.config, "mask_token_id", None) or 126336
-    observer = OptimizedOMTPObserver(
+    mask_id = spec.mask_token_id
+    reliability = reliability_options(args)
+    observer_class = ReliableOMTPObserver if reliability.enabled else OptimizedOMTPObserver
+    observer = observer_class(
+        **({"reliability": reliability} if reliability.enabled else {}),
         tokenizer=tokenizer,
         candidate_names=sample.candidate_names,
         stable_n=args.stable_n,
@@ -89,25 +134,48 @@ def _run_sample(
             min_margin=args.min_margin,
         ),
         profile_enabled=args.profile_observer,
+        record_history=getattr(args, "debug_output", False),
     )
+    if observer_factory is not None:
+        observer = observer_factory(observer)
     sample_seed = args.seed + sample_index
     baseline_output = None
     baseline_time = None
     baseline_nfe = None
     if sample_index < args.parity_samples:
-        _generate_once(args=args, model=model, prompt_ids=prompt_ids, mask_id=mask_id, observer=None, seed=sample_seed, device=device)
+        _generate_once(args=args, model=model, prompt_ids=prompt_ids, mask_id=mask_id, observer=None, seed=sample_seed, device=device, generation_prefix_ids=response_prefill.token_ids)
         baseline_output, baseline_nfe, baseline_time = _generate_once(
             args=args, model=model, prompt_ids=prompt_ids, mask_id=mask_id,
             observer=None, seed=sample_seed, device=device,
+            generation_prefix_ids=response_prefill.token_ids,
         )
     output, nfe, generation_time = _generate_once(
         args=args, model=model, prompt_ids=prompt_ids, mask_id=mask_id,
         observer=observer, seed=sample_seed, device=device,
+        generation_prefix_ids=response_prefill.token_ids,
     )
     generated_ids = output[0, prompt_ids.shape[1]:].detach().cpu().tolist()
     raw_output = tokenizer.decode(generated_ids, skip_special_tokens=True)
     evaluated = _decode_completion(tokenizer, generated_ids)
-    parsed = parse_tool_calls(evaluated, sample.candidate_names)
+    compact = compact_sample(
+        sample=sample, seed=sample_seed, observer=observer, tokenizer=tokenizer,
+        generated_ids=generated_ids, raw_output=raw_output, completion=evaluated,
+        generation_time_s=generation_time, forward_count=nfe,
+        prompt_token_count=int(prompt_ids.shape[1]),
+        observer_off_time_s=baseline_time,
+        output_identical=(bool(torch.equal(baseline_output, output)) if baseline_output is not None else None),
+        nfe_identical=(baseline_nfe == nfe if baseline_nfe is not None else None),
+    )
+    compact["remaining_mask_count"] = generated_ids.count(mask_id)
+    if not getattr(args, "debug_output", False):
+        return compact, observer
+    output_schema = getattr(args, "output_schema", "standard")
+    parsed = parse_tool_calls(
+        evaluated,
+        sample.candidate_names,
+        output_schema=output_schema,
+        functions=sample.functions,
+    )
     predicted_calls = parsed.calls if parsed.format_valid else []
     partial_names = extract_partial_names(evaluated, sample.candidate_names)
     final_occurrences = (
@@ -129,7 +197,28 @@ def _run_sample(
         "sample_id": sample.sample_id,
         "method": METHOD_NAME,
         "cache_mode": args.cache_mode,
-        "observer_implementation": "optimized",
+        "output_schema": output_schema,
+        "model_output_tool_calls": model_call_items(evaluated),
+        "flat_conversion_applied": output_schema == "flat_name_v1",
+        "flat_conversion_valid": (
+            parsed.valid if output_schema == "flat_name_v1" else None
+        ),
+        "flat_conversion_error": (
+            parsed.error if output_schema == "flat_name_v1" else None
+        ),
+        "converted_standard_tool_calls": predicted_calls,
+        "parameter_aliases": parameter_aliases(sample.functions),
+        "response_mode": response_prefill.mode,
+        "generation_prefix_text": response_prefill.text,
+        "generation_prefix_token_ids": list(response_prefill.token_ids),
+        "generation_prefix_token_count": len(response_prefill.token_ids),
+        "generation_prefix_is_model_generated": False,
+        "observer_implementation": "reliable_optimized" if reliability.enabled else "optimized",
+        "observer_reliability_options": vars(reliability),
+        "observer_confidence_gates": {
+            "min_top1_score": args.min_top1_score,
+            "min_margin": args.min_margin,
+        },
         "candidate_tools": sample.candidate_names,
         "final_tools": final_tools,
         "ground_truth_tools": sorted(sample.ground_truth_tool_types),
@@ -144,6 +233,13 @@ def _run_sample(
         "final_json_error": parsed.error,
         **evaluate_final_calls(sample, predicted_calls),
         "omtp_events": observer.events,
+        "prefix_event_audit": [
+            audit_prefix_event(
+                event, generated_ids=generated_ids, tokenizer=tokenizer,
+                candidate_names=sample.candidate_names,
+            )
+            for event in observer.events if event["source"] == "prefix"
+        ],
         "omtp_fallback_events": online["events"],
         "per_tool_predictions": online["per_tool_predictions"],
         "natural_detection_times": online["natural_detection_times"],
@@ -208,11 +304,13 @@ def _run_sample(
         "steps": observer.steps,
         "omtp_trajectory": observer.trajectory,
     }
-    return record, observer
+    compact["debug"] = record
+    return compact, observer
 
 
-def _metadata(args: argparse.Namespace, output: Path, device: torch.device) -> None:
+def _metadata(args: argparse.Namespace, device: torch.device) -> dict[str, Any]:
     value = {
+        "record_type": "metadata", "schema_version": "tool_first_v1",
         "created_at": datetime.now().astimezone().isoformat(),
         "command": sys.argv,
         "args": vars(args),
@@ -229,7 +327,11 @@ def _metadata(args: argparse.Namespace, output: Path, device: torch.device) -> N
         "algorithm": {
             "name": "OMTP+fallback",
             "cache_mode": args.cache_mode,
+            "response_mode": getattr(args, "response_mode", "native"),
+            "output_schema": getattr(args, "output_schema", "standard"),
             "observer_implementation": "optimized",
+            "reliability_options": vars(reliability_options(args)),
+            "confidence_gates": {"min_top1_score": args.min_top1_score, "min_margin": args.min_margin},
             "anchor": "JSON name logits anchor, outer tool-call object only",
             "score": "candidate mean log-probability, region top-2 mean",
             "online_parameters": {
@@ -239,186 +341,47 @@ def _metadata(args: argparse.Namespace, output: Path, device: torch.device) -> N
             },
             "ground_truth_used_online": False,
             "extra_model_forwards_per_request": 0,
-            "fallback_policy": "first event per occurrence track; latent_region, then unique prefix, then natural",
+            "fallback_policy": "first causal event per tool identity across all tracks and sources",
             "analysis_baseline": NATURAL_BASELINE_NAME,
         },
         "timing_semantics": "All times start before generation canvas construction (including prompt processing by model); OMTP trigger timestamps are sampled after the causal detection/scoring work that produced the event. CUDA model/transfer work is synchronized by the existing callback path.",
         "parity_method": "For selected samples: unmeasured observer-off warmup, measured observer-off run, measured observer-on run with identical seed.",
     }
-    (output / "metadata.json").write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
-def _runtime_failure_record(sample: BFCLSample, error: Exception) -> dict[str, Any]:
-    def empty_result() -> dict[str, Any]:
-        return {
-            "predicted_tools": [], "all_tool_types_prefetched": False,
-            "tool_precision": 0.0, "tool_recall": 0.0,
-            "tool_f1": 0.0, "tool_set_exact_match": False,
-            "false_positive_count": 0,
-            "false_negative_count": len(sample.ground_truth_tool_types),
-            "false_positives": [],
-            "false_negatives": sorted(sample.ground_truth_tool_types),
-            "correct_trigger_coverage": 0.0,
-            "online_first_trigger_time_s": None,
-            "oracle_first_correct_prediction_time_s": None,
-            "oracle_all_correct_coverage_time_s": None,
-            "oracle_exact_set_time_s": None,
-            "first_times_by_tool": {}, "trigger_count": 0,
-            "paired_exact_set_lead_vs_natural_s": None,
-            "predicted_tool_occurrences": [],
-            "expected_tool_occurrences": [],
-            "occurrence_precision": 0.0, "occurrence_recall": 0.0,
-            "occurrence_f1": 0.0,
-            "all_tool_occurrences_prefetched": False,
-            "tool_occurrence_count_match": False,
-            "tool_occurrence_multiset_exact_match": False,
-            "oracle_all_occurrences_covered_time_s": None,
-            "oracle_exact_occurrence_multiset_time_s": None,
-            "natural_all_occurrences_covered_time_s": None,
-            "paired_all_occurrences_lead_vs_natural_s": None,
-            "position_correct_count": 0, "position_total": 0,
-            "position_accuracy": 0.0, "position_exact_match": False,
-            "position_records": [],
-        }
-    message = f"{type(error).__name__}: {error}"
-    return {
-        "sample_id": sample.sample_id, "method": METHOD_NAME,
-        "cache_mode": None,
-        "observer_implementation": "optimized",
-        "candidate_tools": sample.candidate_names,
-        "final_tools": [], "ground_truth_tools": sorted(sample.ground_truth_tool_types),
-        "final_tool_occurrences": [],
-        "ground_truth_tool_occurrences": [call["name"] for call in sample.ground_truth_calls],
-        "generated_tool_calls": [], "raw_output": "", "evaluated_output_before_eos": "",
-        "final_json_valid": False, "tool_call_format_valid": False,
-        "candidate_names_valid": False, "final_json_error": message,
-        "tool_name_precision": 0.0, "tool_name_recall": 0.0, "tool_name_f1": 0.0,
-        "tool_set_exact_match": False, "tool_type_precision": 0.0,
-        "tool_type_recall": 0.0, "tool_type_f1": 0.0,
-        "tool_call_count_match": False, "bfcl_ast_compatible_match": False,
-        "omtp_events": [], "omtp_fallback_events": [], "per_tool_predictions": [],
-        "natural_detection_times": {}, "generation_time_s": None,
-        "omtp_tool_precision": 0.0, "omtp_tool_recall": 0.0, "omtp_tool_f1": 0.0,
-        "omtp_tool_set_exact_match": False, "first_correct_prediction_time_s": None,
-        "all_tool_types_prefetched": False,
-        "all_tool_types_prefetched_time_s": None,
-        "all_correct_prediction_time_s": None,
-        "natural_first_detection_time_s": None,
-        "natural_all_detection_time_s": None,
-        "natural_all_tool_types_detection_time_s": None,
-        "omtp_lead_vs_natural_s": None,
-        "all_tool_occurrences_prefetched": False,
-        "tool_occurrence_multiset_exact_match": False,
-        "position_accuracy": 0.0, "position_exact_match": False,
-        "all_occurrences_prediction_time_s": None,
-        "all_occurrences_lead_vs_natural_s": None,
-        "omtp_evaluation": {
-            "vs_final": empty_result(),
-            "vs_ground_truth": empty_result(),
-        },
-        "natural_baseline": {
-            "method": NATURAL_BASELINE_NAME, "events": [],
-            "vs_final": empty_result(),
-            "vs_ground_truth": empty_result(),
-        },
-        "position_comparison": {"vs_final": [], "vs_ground_truth": []},
-        "forward_count": None, "model_forward_time_s": None,
-        "observer_processing_time_s": None, "observer_mean_processing_time_s": None,
-        "omtp_processing_time_s": None, "observer_off_generation_time_s": None,
-        "observer_output_identical": None, "observer_nfe_identical": None,
-        "observer_wall_overhead_ratio": None, "prompt_token_count": None,
-        "observer_profile": {}, "runtime_error": message, "steps": [],
-        "omtp_trajectory": [],
+    source = Path(__file__).resolve().parent
+    value["code_sha256"] = {
+        name: _sha256(source / name) for name in (
+            "run_omtp_experiment.py", "omtp_observer.py", "optimized_omtp_observer.py",
+            "reliable_omtp_observer.py", "prefix_detection.py", "experiment_output.py",
+            "observer.py", "fastdllm_generate.py", "prompting.py", "tool_parser.py",
+        )
     }
+    return value
 
 
 def main() -> None:
     args = parse_args()
     if args.temperature != 0 or args.gen_length % args.block_length:
-        raise ValueError("OMTP smoke requires temperature=0 and divisible block length")
+        raise ValueError("OMTP requires temperature=0 and divisible block length")
     if args.steps % (args.gen_length // args.block_length):
         raise ValueError("steps must be divisible by block count")
     if args.limit < 1 or args.parity_samples < 0:
         raise ValueError("invalid limit/parity-samples")
     if args.device.startswith("cuda") and not torch.cuda.is_available():
         raise RuntimeError("CUDA requested but unavailable")
-    output = Path(args.output_dir)
-    protected = (
-        "samples.jsonl", "steps.jsonl", "failures.jsonl", "metadata.json",
-        "omtp_events.jsonl", "omtp_trajectory.jsonl", "omtp_samples.jsonl",
-        "omtp_fallback_events.jsonl", "natural_events.jsonl",
-        "position_records.jsonl", "omtp_position_summary.csv",
-        "omtp_summary.csv", "omtp_comparison.csv", "omtp_diagnostics.csv",
-    )
-    for name in protected:
-        if (output / name).exists():
-            raise FileExistsError(f"refusing to overwrite {output / name}")
-    output.mkdir(parents=True, exist_ok=True)
-    device = torch.device(args.device)
-    model, tokenizer = _load_model(args, device)
-    _metadata(args, output, device)
     samples = list(iter_samples(args.questions, args.answers, limit=args.limit, start=args.start))
-    paths = {name: (output / name).open("w", encoding="utf-8") for name in (
-        "samples.jsonl", "steps.jsonl", "failures.jsonl", "omtp_events.jsonl",
-        "omtp_fallback_events.jsonl", "natural_events.jsonl",
-        "position_records.jsonl",
-        "omtp_trajectory.jsonl", "omtp_samples.jsonl",
-    )}
-    try:
+    device = torch.device(args.device)
+    with open_result_file(args.output_dir) as handle:
+        model, tokenizer = _load_model(args, device)
+        write_record(handle, _metadata(args, device))
         for index, sample in enumerate(samples):
             print(f"[{index + 1}/{len(samples)}] {sample.sample_id}", flush=True)
             try:
-                record, observer = _run_sample(args, sample, index, model, tokenizer, device)
+                record, _ = _run_sample(args, sample, index, model, tokenizer, device)
             except Exception as error:
-                failure = {"sample_id": sample.sample_id, "failure_types": ["runtime_error"], "error": f"{type(error).__name__}: {error}"}
-                paths["failures.jsonl"].write(json.dumps(failure, ensure_ascii=False) + "\n")
-                paths["failures.jsonl"].flush()
-                print(f"  FAILED: {failure['error']}", file=sys.stderr, flush=True)
-                record = _runtime_failure_record(sample, error)
-                record["cache_mode"] = args.cache_mode
-                serialized = json.dumps(record, ensure_ascii=False) + "\n"
-                paths["samples.jsonl"].write(serialized)
-                paths["omtp_samples.jsonl"].write(serialized)
-                continue
-            serialized = json.dumps(record, ensure_ascii=False) + "\n"
-            paths["samples.jsonl"].write(serialized)
-            paths["omtp_samples.jsonl"].write(serialized)
-            for step in record["steps"]:
-                paths["steps.jsonl"].write(json.dumps({"sample_id": sample.sample_id, **step}, ensure_ascii=False) + "\n")
-            for event in observer.events:
-                paths["omtp_events.jsonl"].write(json.dumps({"sample_id": sample.sample_id, **event}, ensure_ascii=False) + "\n")
-            for event in record["omtp_fallback_events"]:
-                paths["omtp_fallback_events.jsonl"].write(json.dumps({"sample_id": sample.sample_id, **event}, ensure_ascii=False) + "\n")
-            for event in record["natural_baseline"]["events"]:
-                paths["natural_events.jsonl"].write(json.dumps({"sample_id": sample.sample_id, **event}, ensure_ascii=False) + "\n")
-            for reference, rows in record["position_comparison"].items():
-                for row in rows:
-                    paths["position_records.jsonl"].write(json.dumps({
-                        "sample_id": sample.sample_id,
-                        "reference": reference,
-                        **row,
-                    }, ensure_ascii=False) + "\n")
-            for row in observer.trajectory:
-                paths["omtp_trajectory.jsonl"].write(json.dumps({"sample_id": sample.sample_id, **row}, ensure_ascii=False) + "\n")
-            failures = []
-            if not record["final_json_valid"]: failures.append("invalid_json")
-            if not record["tool_set_exact_match"]: failures.append("final_tool_set_mismatch")
-            if not record["omtp_tool_set_exact_match"]: failures.append("omtp_ground_truth_set_mismatch")
-            if record["observer_output_identical"] is False: failures.append("observer_changed_output")
-            if record["observer_nfe_identical"] is False: failures.append("observer_changed_nfe")
-            if failures:
-                paths["failures.jsonl"].write(json.dumps({
-                    "sample_id": sample.sample_id, "failure_types": failures,
-                    "raw_output": record["raw_output"],
-                    "omtp_events": record["omtp_events"],
-                }, ensure_ascii=False) + "\n")
-            for handle in paths.values():
-                handle.flush()
-    finally:
-        for handle in paths.values():
-            handle.close()
-    build_omtp_report(output)
-    print(f"Results written to {output.resolve()}")
+                print(f"  FAILED: {type(error).__name__}: {error}", file=sys.stderr, flush=True)
+                record = failure_sample(sample, args.seed + index, error)
+            write_record(handle, record)
+    print(f"Results written to {Path(args.output_dir).resolve() / 'samples.jsonl'}")
 
 
 if __name__ == "__main__":

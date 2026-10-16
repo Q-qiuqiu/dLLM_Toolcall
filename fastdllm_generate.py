@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import time
-from typing import Callable, Optional
+from typing import Callable, Optional, Sequence
 
 import numpy as np
 import torch
@@ -44,6 +44,34 @@ class ForwardObservation:
 
 
 ObservationCallback = Callable[[ForwardObservation], None]
+
+
+def _apply_generation_prefix(
+    x: torch.Tensor,
+    *,
+    prompt_length: int,
+    gen_length: int,
+    mask_id: int,
+    generation_prefix_ids: Optional[Sequence[int]],
+) -> int:
+    """Commit an explicit prefix inside the generation canvas."""
+
+    if generation_prefix_ids is None:
+        return 0
+    prefix = torch.as_tensor(
+        generation_prefix_ids, dtype=torch.long, device=x.device
+    )
+    if prefix.ndim != 1:
+        raise ValueError("generation_prefix_ids must be a one-dimensional sequence")
+    prefix_length = int(prefix.numel())
+    if prefix_length == 0:
+        return 0
+    if prefix_length >= gen_length:
+        raise ValueError("generation prefix must be shorter than gen_length")
+    if bool((prefix == mask_id).any().item()):
+        raise ValueError("generation prefix cannot contain the MASK token")
+    x[:, prompt_length:prompt_length + prefix_length] = prefix.unsqueeze(0)
+    return prefix_length
 
 
 def _synchronize_for(tensor: torch.Tensor) -> None:
@@ -192,6 +220,7 @@ def generate(
     threshold: Optional[float] = None,
     factor: Optional[float] = None,
     observation_callback: Optional[ObservationCallback] = None,
+    generation_prefix_ids: Optional[Sequence[int]] = None,
 ) -> tuple[torch.Tensor, int]:
     """Run the Fast-dLLM v1 no-cache generation path.
 
@@ -221,6 +250,13 @@ def generate(
     )
     x[:, : prompt.shape[1]] = prompt.clone()
     prompt_length = int(prompt.shape[1])
+    _apply_generation_prefix(
+        x,
+        prompt_length=prompt_length,
+        gen_length=gen_length,
+        mask_id=mask_id,
+        generation_prefix_ids=generation_prefix_ids,
+    )
     nfe = 0
 
     for block_index in range(num_blocks):
@@ -314,6 +350,7 @@ def generate_with_dual_cache(
     threshold: Optional[float] = None,
     factor: Optional[float] = None,
     observation_callback: Optional[ObservationCallback] = None,
+    generation_prefix_ids: Optional[Sequence[int]] = None,
 ) -> tuple[torch.Tensor, int]:
     """Fast-dLLM v1 Dual Cache with a zero-extra-forward observer hook.
 
@@ -353,6 +390,13 @@ def generate_with_dual_cache(
         device=model.device,
     )
     x[:, :prompt_length] = prompt.clone()
+    _apply_generation_prefix(
+        x,
+        prompt_length=prompt_length,
+        gen_length=gen_length,
+        mask_id=mask_id,
+        generation_prefix_ids=generation_prefix_ids,
+    )
     nfe = 0
 
     for block_index in range(num_blocks):
