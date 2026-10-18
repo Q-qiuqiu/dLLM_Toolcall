@@ -142,7 +142,8 @@ def test_summary_separates_model_invalid_name_from_physical_false_start():
     assert report['paired_lead_s']['mean'] == 0.
 
 
-def test_taskbench_cli_only_one_jsonl_and_failures_are_retained(tmp_path, monkeypatch):
+@pytest.mark.parametrize('mode', ['omtp', 'natural'])
+def test_taskbench_cli_only_one_jsonl_and_failures_are_retained(tmp_path, monkeypatch, mode):
     import run_taskbench_experiment as runner
     target = '[{"name":"weather","arguments":{}}]'
     tokenizer = PromptTokenizer(target)
@@ -165,6 +166,7 @@ def test_taskbench_cli_only_one_jsonl_and_failures_are_retained(tmp_path, monkey
         model_path='fake', fastdllm_root=str(tmp_path), device='cpu', dtype='float32',
         generation_profile='fixed128', prompt_profile='original', cache_mode='none',
         response_mode='native', output_schema='standard', parity_samples=1, debug_output=False,
+        observer_mode=mode,
     )
     # Generate a 128-position canvas with EOS after the fixed target.
     model.ids += [125] * (128 - len(model.ids))
@@ -181,6 +183,8 @@ def test_taskbench_cli_only_one_jsonl_and_failures_are_retained(tmp_path, monkey
     values = [json.loads(line) for line in (output / 'samples.jsonl').read_text().splitlines()]
     assert len(values) == 3
     assert values[0]['schema_version'] == 'tool_first_v1'
+    assert (values[0]['online_method']['name'] == 'natural_only') == (mode == 'natural')
+    assert values[1]['observer_mode'] == mode
     assert values[1]['forward_count'] == 32
     assert values[1]['parity']['output_identical']
     assert values[2]['generation_time_s'] is None

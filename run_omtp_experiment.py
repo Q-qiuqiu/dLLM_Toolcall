@@ -1,8 +1,9 @@
-"""Run BFCL parallel_multiple with the fixed OMTP + fallback policy."""
+"""Run BFCL parallel_multiple with OMTP + fallback or a Natural-only baseline."""
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 from datetime import datetime
 from pathlib import Path
 import platform
@@ -22,6 +23,7 @@ from reliable_omtp_observer import ReliableOMTPObserver, add_reliability_argumen
 from prefix_detection import audit_prefix_event
 from experiment_output import compact_sample, failure_sample, open_result_file, write_record
 from model_adapter import runtime_spec
+from natural_observer import NaturalOnlyObserver, add_observer_arguments, validate_observer_mode
 from prompting import render_prompt
 from response_prefill import RESPONSE_MODES, resolve_response_prefill
 from tool_format import OUTPUT_SCHEMAS, model_call_items, parameter_aliases
@@ -38,6 +40,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-path", default="/data/labshare/Param/llada")
     parser.add_argument("--fastdllm-root", default="/data/home/yzx/Fast-dLLM")
     parser.add_argument("--output-dir", required=True)
+    add_observer_arguments(parser)
     parser.add_argument("--limit", type=int, default=20)
     parser.add_argument("--start", type=int, default=0)
     parser.add_argument("--gen-length", type=int, default=128)
@@ -100,7 +103,8 @@ def _run_sample(
     tokenizer: Any,
     device: torch.device,
     *, observer_factory: Any = None,
-) -> tuple[dict[str, Any], OMTPObserver]:
+) -> tuple[dict[str, Any], OMTPObserver | NaturalOnlyObserver]:
+    validate_observer_mode(args)
     prompt = render_prompt(
         tokenizer,
         sample,
@@ -118,25 +122,34 @@ def _run_sample(
         raise ValueError(f"{sample.sample_id}: prompt plus generation exceeds context")
     mask_id = spec.mask_token_id
     reliability = reliability_options(args)
-    observer_class = ReliableOMTPObserver if reliability.enabled else OptimizedOMTPObserver
-    observer = observer_class(
-        **({"reliability": reliability} if reliability.enabled else {}),
-        tokenizer=tokenizer,
-        candidate_names=sample.candidate_names,
-        stable_n=args.stable_n,
-        config=OMTPConfig(
+    natural_only = getattr(args, "observer_mode", "omtp") == "natural"
+    if natural_only:
+        observer = NaturalOnlyObserver(
+            tokenizer=tokenizer, candidate_names=sample.candidate_names,
+            record_history=getattr(args, "debug_output", False),
+        )
+    else:
+        observer_class = ReliableOMTPObserver if reliability.enabled else OptimizedOMTPObserver
+        observer = observer_class(
+            **({"reliability": reliability} if reliability.enabled else {}),
+            tokenizer=tokenizer,
+            candidate_names=sample.candidate_names,
             stable_n=args.stable_n,
-            region_radius=args.region_radius,
-            region_top_k=args.region_top_k,
-            min_seen=args.min_seen,
-            min_support=args.min_support,
-            min_top1_score=args.min_top1_score,
-            min_margin=args.min_margin,
-        ),
-        profile_enabled=args.profile_observer,
-        record_history=getattr(args, "debug_output", False),
-    )
+            config=OMTPConfig(
+                stable_n=args.stable_n,
+                region_radius=args.region_radius,
+                region_top_k=args.region_top_k,
+                min_seen=args.min_seen,
+                min_support=args.min_support,
+                min_top1_score=args.min_top1_score,
+                min_margin=args.min_margin,
+            ),
+            profile_enabled=args.profile_observer,
+            record_history=getattr(args, "debug_output", False),
+        )
     if observer_factory is not None:
+        if natural_only:
+            raise ValueError("observer_factory cannot wrap the Natural-only baseline")
         observer = observer_factory(observer)
     sample_seed = args.seed + sample_index
     baseline_output = None
@@ -167,7 +180,13 @@ def _run_sample(
         nfe_identical=(baseline_nfe == nfe if baseline_nfe is not None else None),
     )
     compact["remaining_mask_count"] = generated_ids.count(mask_id)
+    compact["observer_mode"] = "natural" if natural_only else "omtp"
+    # Outside generation timing: allows strict prompt pairing across new runs.
+    compact["prompt_sha256"] = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
     if not getattr(args, "debug_output", False):
+        return compact, observer
+    if natural_only:
+        compact["debug"] = {"method": "natural_only", "steps": observer.steps}
         return compact, observer
     output_schema = getattr(args, "output_schema", "standard")
     parsed = parse_tool_calls(
@@ -352,14 +371,28 @@ def _metadata(args: argparse.Namespace, device: torch.device) -> dict[str, Any]:
         name: _sha256(source / name) for name in (
             "run_omtp_experiment.py", "omtp_observer.py", "optimized_omtp_observer.py",
             "reliable_omtp_observer.py", "prefix_detection.py", "experiment_output.py",
-            "observer.py", "fastdllm_generate.py", "prompting.py", "tool_parser.py",
+            "observer.py", "natural_observer.py", "fastdllm_generate.py", "prompting.py", "tool_parser.py",
         )
     }
+    if getattr(args, "observer_mode", "omtp") == "natural":
+        value["algorithm"] = {
+            "name": "natural_only", "observer_implementation": "committed_tokens_only",
+            "detection": "shared detect_committed_tools, identical to OMTP Natural recognition",
+            "ground_truth_used_online": False, "extra_model_forwards_per_request": 0,
+            "logits_accessed": False, "prefix_or_region_scoring": False,
+        }
+        value["timing_semantics"] = (
+            "Same generation time zero and synchronized callback as OMTP. "
+            "Triggers include committed-token D2H copy, sparse decoding and detection. "
+            "No OMTP/argmax/prefix/scoring work. Minimal observer and callback overhead remains; "
+            "this is NOT a zero-overhead observer-off run."
+        )
     return value
 
 
 def main() -> None:
     args = parse_args()
+    validate_observer_mode(args)
     if args.temperature != 0 or args.gen_length % args.block_length:
         raise ValueError("OMTP requires temperature=0 and divisible block length")
     if args.steps % (args.gen_length // args.block_length):

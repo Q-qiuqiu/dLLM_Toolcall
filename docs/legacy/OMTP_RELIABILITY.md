@@ -1,7 +1,11 @@
 # OMTP reliability development experiment
 
+> 历史策略开发记录：逐轮开发运行器和旧多文件分析脚本已经退役。
+> 本文保留开发结论，不是当前可执行命令清单。正式入口与独立 Natural 基线见
+> [项目 README](../../README.md) 和 [EXPERIMENT_OUTPUT.md](../../EXPERIMENT_OUTPUT.md)。
+
 This document describes the historical ablation and multi-file output. Current
-runner output is a single `samples.jsonl`; use [EXPERIMENT_OUTPUT.md](EXPERIMENT_OUTPUT.md).
+runner output is a single `samples.jsonl`; use [EXPERIMENT_OUTPUT.md](../../EXPERIMENT_OUTPUT.md).
 The current prefix validation and first-per-tool arbitration are bug fixes on
 top of the selected policy, not the untouched historical algorithm.
 

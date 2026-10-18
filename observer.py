@@ -64,6 +64,20 @@ def decode_temporary(tokenizer: Any, token_ids: list[int]) -> str:
     return tokenizer.decode(token_ids[:stop], skip_special_tokens=True)
 
 
+def detect_committed_tools(
+    tokenizer: Any, token_ids: list[int], mask_id: int,
+    candidate_names: Iterable[str],
+) -> tuple[str, list[str], list[str]]:
+    """Shared Natural detector; never inspect logits or join across MASK gaps.
+
+    Callers supply only the generated region. Keep exactly the committed-text
+    parsing semantics used by OMTP, including incomplete JSON handling.
+    """
+    text = decode_sparse_committed(tokenizer, token_ids, mask_id)
+    names = extract_partial_names(text, candidate_names)
+    return text, names, ordered_unique(names)
+
+
 @dataclass(frozen=True)
 class OnlineStableEvent:
     forward_index: int
@@ -130,18 +144,14 @@ class ToolCallObserver:
         committed_text_before = decode_sparse_committed(
             self.tokenizer, before_ids, observation.mask_id
         )
-        committed_text = decode_sparse_committed(
-            self.tokenizer, after_ids, observation.mask_id
+        committed_text, natural_names, natural_types = detect_committed_tools(
+            self.tokenizer, after_ids, observation.mask_id, self.candidate_names
         )
         temporary_text = decode_temporary(self.tokenizer, temporary_ids)
 
-        natural_names = extract_partial_names(
-            committed_text, self.candidate_names
-        )
         predicted_names = extract_partial_names(
             temporary_text, self.candidate_names
         )
-        natural_types = ordered_unique(natural_names)
         predicted_types = ordered_unique(predicted_names)
         predicted_set = frozenset(predicted_types)
 
@@ -235,4 +245,5 @@ __all__ = [
     "ToolCallObserver",
     "decode_sparse_committed",
     "decode_temporary",
+    "detect_committed_tools",
 ]

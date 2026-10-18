@@ -1,0 +1,54 @@
+{
+  "bfcl_revision": "58f57e9124ea981403792dd51e00a6577e621fae",
+  "taskbench_revision": "d12764a8fa650f49f50507a02c3e707c71c67621",
+  "files": [
+    {
+      "path": "third_party/official_eval/bfcl_58f57e9/bfcl_eval/constants/enums.py",
+      "url": "https://raw.githubusercontent.com/ShishirPatil/gorilla/58f57e9124ea981403792dd51e00a6577e621fae/berkeley-function-call-leaderboard/bfcl_eval/constants/enums.py",
+      "bytes": 896,
+      "sha256": "2182becfa2a1d071ee1db30db593b4758c6bf866aa12d2d4b8daf09175ea518a"
+    },
+    {
+      "path": "third_party/official_eval/bfcl_58f57e9/bfcl_eval/constants/type_mappings.py",
+      "url": "https://raw.githubusercontent.com/ShishirPatil/gorilla/58f57e9124ea981403792dd51e00a6577e621fae/berkeley-function-call-leaderboard/bfcl_eval/constants/type_mappings.py",
+      "bytes": 1813,
+      "sha256": "1702fb67afbe2c492608e58e2b7d02e46381f50166b47f3c952f76e34c7cd3bd"
+    },
+    {
+      "path": "third_party/official_eval/bfcl_58f57e9/bfcl_eval/constants/model_config.py",
+      "url": "https://raw.githubusercontent.com/ShishirPatil/gorilla/58f57e9124ea981403792dd51e00a6577e621fae/berkeley-function-call-leaderboard/bfcl_eval/constants/model_config.py",
+      "bytes": 72640,
+      "sha256": "d2392af592d55867f1c810a938b7588548ea740cad3b705773b3c626339d67a6"
+    },
+    {
+      "path": "third_party/official_eval/bfcl_58f57e9/bfcl_eval/eval_checker/ast_eval/ast_checker.py",
+      "url": "https://raw.githubusercontent.com/ShishirPatil/gorilla/58f57e9124ea981403792dd51e00a6577e621fae/berkeley-function-call-leaderboard/bfcl_eval/eval_checker/ast_eval/ast_checker.py",
+      "bytes": 25032,
+      "sha256": "2aae7a68461a8f76c0be3894c8901b66b56967a1989d3ab066051e3fb97f1538"
+    },
+    {
+      "path": "third_party/official_eval/bfcl_58f57e9/bfcl_eval/eval_checker/ast_eval/type_convertor/java_type_converter.py",
+      "url": "https://raw.githubusercontent.com/ShishirPatil/gorilla/58f57e9124ea981403792dd51e00a6577e621fae/berkeley-function-call-leaderboard/bfcl_eval/eval_checker/ast_eval/type_convertor/java_type_converter.py",
+      "bytes": 15716,
+      "sha256": "2fd4f4b0443b3dd974a1723bb4e45c086d7b352631062da7807ad1ad40706604"
+    },
+    {
+      "path": "third_party/official_eval/bfcl_58f57e9/bfcl_eval/eval_checker/ast_eval/type_convertor/js_type_converter.py",
+      "url": "https://raw.githubusercontent.com/ShishirPatil/gorilla/58f57e9124ea981403792dd51e00a6577e621fae/berkeley-function-call-leaderboard/bfcl_eval/eval_checker/ast_eval/type_convertor/js_type_converter.py",
+      "bytes": 11706,
+      "sha256": "a114e9ff75c025cb52787ac33d6c2fbaa390905c6125a2b3c6afebab232bb5e4"
+    },
+    {
+      "path": "third_party/official_eval/bfcl_58f57e9/LICENSE",
+      "url": "https://raw.githubusercontent.com/ShishirPatil/gorilla/58f57e9124ea981403792dd51e00a6577e621fae/LICENSE",
+      "bytes": 11357,
+      "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+    },
+    {
+      "path": "third_party/official_eval/taskbench_d12764a/evaluate.py",
+      "url": "https://huggingface.co/datasets/microsoft/Taskbench/raw/d12764a8fa650f49f50507a02c3e707c71c67621/evaluate.py",
+      "bytes": 23540,
+      "sha256": "1f3af18fd005fbc063597395143f0f3f80c290494d987308898c100dc80577cc"
+    }
+  ]
+}

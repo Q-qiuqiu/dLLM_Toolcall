@@ -1,4 +1,4 @@
-"""Run TaskBench with OMTP + fallback; write only samples.jsonl."""
+"""Run TaskBench with OMTP + fallback or Natural-only; write only samples.jsonl."""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ import sys
 import torch
 
 from experiment_output import failure_sample, open_result_file, write_record
+from natural_observer import add_observer_arguments, validate_observer_mode
 from prompting import PROMPT_PROFILES
 from reliable_omtp_observer import add_reliability_arguments, reliability_options
 from response_prefill import RESPONSE_MODES
@@ -42,6 +43,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-path", default="/data/labshare/Param/llada")
     parser.add_argument("--fastdllm-root", default="/data/home/yzx/Fast-dLLM")
     parser.add_argument("--output-dir", required=True)
+    add_observer_arguments(parser)
     parser.add_argument("--generation-profile", choices=tuple(GENERATION_PROFILES), default="fixed128")
     parser.add_argument("--prompt-profile", choices=PROMPT_PROFILES, default="compact_json_v3")
     parser.add_argument("--cache-mode", choices=("none", "dual"), default="none")
@@ -65,7 +67,7 @@ def _fixed_runtime_args(cli: argparse.Namespace) -> argparse.Namespace:
 
 def _metadata(args: argparse.Namespace, device: torch.device) -> dict:
     source = Path(__file__).resolve().parent
-    return {
+    value = {
         "record_type": "metadata", "schema_version": "tool_first_v1",
         "created_at": datetime.now().astimezone().isoformat(),
         "command": sys.argv, "args": vars(args),
@@ -80,7 +82,7 @@ def _metadata(args: argparse.Namespace, device: torch.device) -> dict:
         "code_sha256": {
             name: sha256_file(source / name) for name in (
                 "run_taskbench_experiment.py", "run_omtp_experiment.py",
-                "omtp_observer.py", "optimized_omtp_observer.py", "observer.py",
+                "omtp_observer.py", "optimized_omtp_observer.py", "observer.py", "natural_observer.py",
                 "reliable_omtp_observer.py", "prefix_detection.py",
                 "experiment_output.py", "prompting.py", "taskbench_data.py",
                 "fastdllm_generate.py", "model_adapter.py", "response_prefill.py",
@@ -108,6 +110,19 @@ def _metadata(args: argparse.Namespace, device: torch.device) -> dict:
         },
         "prompt_excludes": ["ground_truth_calls", "dependency_edges", "reference_steps"],
     }
+    if getattr(args, "observer_mode", "omtp") == "natural":
+        value["online_method"] = {
+            "name": "natural_only", "observer_implementation": "committed_tokens_only",
+            "detection": "shared detect_committed_tools, identical to OMTP Natural recognition",
+            "ground_truth_used_online": False, "extra_model_forwards": 0,
+            "logits_accessed": False, "prefix_or_region_scoring": False,
+        }
+        value["timing_semantics"].update(
+            events="after committed-token D2H copying, sparse decoding and detection",
+            natural_baseline="independent Natural-only request, without OMTP work",
+            remaining_overhead="minimal committed-token observer and existing synchronized callback; NOT observer-off",
+        )
+    return value
 
 
 def main() -> None:
@@ -117,6 +132,7 @@ def main() -> None:
     if cli.device.startswith("cuda") and not torch.cuda.is_available():
         raise RuntimeError("CUDA requested but unavailable")
     args = _fixed_runtime_args(cli)
+    validate_observer_mode(args)
     samples = list(iter_taskbench_samples(args.manifest, args.tool_catalog))
     if not samples:
         raise ValueError("empty TaskBench manifest")

@@ -1,0 +1,11 @@
+# Install with --target .official_eval_deps --no-deps; do not alter model env.
+# numpy/scipy/sklearn/pandas/click/openpyxl/json-repair reuse the llada env.
+pyarrow==17.0.0
+Levenshtein==0.25.1
+rapidfuzz==3.9.7
+datasets==2.21.0
+dill==0.3.8
+multiprocess==0.70.16
+xxhash==3.5.0
+pytz==2024.2
+attrs==24.2.0

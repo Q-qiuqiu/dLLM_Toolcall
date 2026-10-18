@@ -12,3 +12,4 @@ models/src/**/*.py[cod]
 !models/model_manifest.json
 !models/inputs/
 !models/inputs/**
+/.official_eval_deps/
